@@ -1,0 +1,70 @@
+{
+  "name": "lyricvision-lcd",
+  "version": "0.1.0",
+  "description": "Spotify synced-lyrics display for Thermalright USB LCD panels (Vision MAX / Vision 360). Windows-only v0.1.",
+  "license": "Apache-2.0",
+  "keywords": [
+    "spotify",
+    "lyrics",
+    "synced-lyrics",
+    "lcd",
+    "usb-lcd",
+    "thermalright",
+    "vision-max",
+    "electron",
+    "python",
+    "windows",
+    "lrclib"
+  ],
+  "main": "src/main.js",
+  "packageManager": "pnpm@12.5.1",
+  "//electron": "Electron 44.4.3 = latest stable published on the npm registry at scaffold time (2026-09-20).",
+  "//signing": "v0.1 ships UNSIGNED (no code signing yet). This blocks public release, not local dev/packaging.",
+  "//publish": "CI release workflow (.github/workflows/release.yml) publishes on v* tags: unsigned Setup.exe + checksums.txt, notes from docs/release-notes-<tag>.md. Signing not wired yet.",
+  "scripts": {
+    "preinstall": "npx -y only-allow pnpm",
+    "start": "electron .",
+    "verify:spawn": "node tests/test_shell_spawn.js",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder --win nsis"
+  },
+  "build": {
+    "appId": "com.lyricvision.app",
+    "productName": "LyricVision LCD",
+    "files": [
+      "src/**/*",
+      "bridge/**/*",
+      "panels/**/*"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false
+    },
+    "extraResources": [
+      {
+        "from": "resources/lcd_bridge.exe",
+        "to": "lcd_bridge.exe"
+      }
+    ],
+    "publish": [
+      {
+        "provider": "github"
+      }
+    ]
+  },
+  "devDependencies": {
+    "electron": "44.4.3",
+    "electron-builder": "26.15.3"
+  },
+  "dependencies": {}
+}

@@ -1,0 +1,50 @@
+name: smoke
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.5.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install Python bridge deps
+        run: pip install -r bridge/requirements.txt
+      - name: Install Node deps
+        run: pnpm install --frozen-lockfile
+      - name: Python smokes (hardware-free)
+        run: |
+          python tests/test_registry.py
+          python tests/test_protocol.py
+          python tests/test_bridge.py
+          python tests/test_cover.py
+      - name: Node syntax check
+        run: |
+          node --check src/main.js
+          node --check src/preload.js
+          node --check src/hardening.js
+          node --check src/bridge-spawn.js
+          node --check tests/test_sync_settings.js
+          node --check tests/test_hardening.js
+          node --check tests/test_shell_spawn.js
+      - name: Node smokes (hardware-free)
+        run: |
+          node tests/test_sync_settings.js
+          node tests/test_hardening.js
+      # Hardware-gated: test_shell_spawn.js launches the real bridge against
+      # the physical panel and needs TRCC/SignalRGB closed (exclusive hold).
+      # Without glass the bridge exits 3 (`blocked`), so this step must never
+      # turn CI red: non-blocking by design.
+      - name: Spawn-path check (needs glass, non-blocking)
+        continue-on-error: true
+        run: node tests/test_shell_spawn.js

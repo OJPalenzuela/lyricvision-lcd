@@ -1,0 +1,17 @@
+# Pinned bridge dependencies (Windows-only v0.1, CPython 3.14, win_amd64).
+# Hashes resolved against PyPI on 2026-09-20. Pillow/numpy hashes are for
+# the cp314-win_amd64 wheels (platform-specific); pyusb ships a universal wheel.
+# To re-resolve (new interpreter, new platform, or version bump), create a
+# bridge/requirements.in with the loose pins and run:
+#   pip-compile --generate-hashes bridge/requirements.in -o bridge/requirements.txt
+# then verify with: pip install --require-hashes -r bridge/requirements.txt
+pyusb==1.3.1 \
+    --hash=sha256:bf9b754557af4717fe80c2b07cc2b923a9151f5c08d17bdb5345dac09d6a0430
+Pillow==12.3.0 \
+    --hash=sha256:fdafc9cce40277e0f7a0feabce0ee50dd2fa1800f3b38015e51296b5e814048d
+numpy==2.5.3 \
+    --hash=sha256:2c25dfa72943e4336ddb6b0ee4277b47a0c85bede0807530ec68103bf58e2c10
+libusb-package==1.0.30.0 \
+    --hash=sha256:90808da724c8939a333d931d0c7226372ca5fefd98e2f2f3ef79fd918aa37522
+importlib_resources==7.1.0 \
+    --hash=sha256:1bd7b48b4088eddb2cd16382150bb515af0bd2c70128194392725f82ad2c96a1

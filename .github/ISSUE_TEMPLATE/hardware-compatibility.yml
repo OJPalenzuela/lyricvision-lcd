@@ -1,0 +1,147 @@
+name: Hardware compatibility
+description: Report a Thermalright LCD panel (tested, experimental, or unknown).
+title: "[hardware] "
+labels: ["hardware"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping map Thermalright panels. This template collects
+        the minimum needed to identify a panel. Do not include tokens,
+        client secrets, USB serial numbers, or private paths.
+  - type: input
+    id: model
+    attributes:
+      label: Panel model
+      description: Cooler and panel name as sold (for example, Peerless Assassin 120 Vision MAX).
+      placeholder: Peerless Assassin 120 Vision MAX
+    validations:
+      required: true
+  - type: input
+    id: lcd-size
+    attributes:
+      label: LCD size
+      description: Advertised size and glass resolution if known (for example, 480x854 portrait).
+      placeholder: 480x854 portrait
+    validations:
+      required: true
+  - type: dropdown
+    id: windows-version
+    attributes:
+      label: Windows version
+      description: Windows release the panel was tested on.
+      options:
+        - Windows 11 24H2
+        - Windows 11 23H2
+        - Windows 10 22H2
+        - Other (describe below)
+      default: 0
+    validations:
+      required: true
+  - type: input
+    id: vid-pid
+    attributes:
+      label: USB VID/PID
+      description: Vendor and product IDs from Device Manager (for example, 87AD:70DB).
+      placeholder: 87AD:70DB
+    validations:
+      required: true
+  - type: textarea
+    id: usb-interface
+    attributes:
+      label: USB interface
+      description: Interface number, class, bulk endpoints, and wMaxPacketSize if known.
+      placeholder: Interface 0, class 0xFF, OUT 0x01 / IN 0x81, wMaxPacketSize 512
+    validations:
+      required: false
+  - type: input
+    id: trcc-version
+    attributes:
+      label: TRCC version
+      description: Thermalright Control Center version, or "not installed".
+      placeholder: 1.2.3 / not installed
+    validations:
+      required: true
+  - type: dropdown
+    id: signalrgb
+    attributes:
+      label: SignalRGB installed?
+      description: Whether SignalRGB is installed on the test machine.
+      options:
+        - Not installed
+        - Installed and fully quit during the test
+        - Installed and running during the test
+      default: 0
+    validations:
+      required: true
+  - type: textarea
+    id: photos
+    attributes:
+      label: Panel photos
+      description: Drag front photos of the glass here (panel powered, displaying content if possible).
+      placeholder: Attach at least one front photo of the glass.
+    validations:
+      required: true
+  - type: textarea
+    id: device-manager
+    attributes:
+      label: Device Manager screenshot
+      description: What Device Manager shows for the panel (device name, USB section). Drag the screenshot here.
+      placeholder: Attach a Device Manager screenshot.
+    validations:
+      required: true
+  - type: textarea
+    id: usb-descriptor
+    attributes:
+      label: USB descriptor
+      description: VID/PID, compatible ID, interface and endpoint summary. Never paste device serial numbers.
+      placeholder: USB\VID_87AD&PID_70DB...
+    validations:
+      required: false
+  - type: dropdown
+    id: trcc-detects
+    attributes:
+      label: Does TRCC detect the panel?
+      options:
+        - Yes
+        - No
+        - Not tested
+      default: 2
+    validations:
+      required: true
+  - type: dropdown
+    id: app-detects
+    attributes:
+      label: Does LyricVision detect the panel?
+      description: Status line or bridge exit code observed (for example, panel-unknown, blocked, no-device, frames shown).
+      options:
+        - Shows frames on the glass
+        - Detected but image is wrong (describe below)
+        - panel-unknown (bridge exit 2)
+        - blocked / no-device (bridge exit 3)
+        - Not tested
+      default: 4
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Image, orientation, stability, ACKs
+      description: What appears on the glass, orientation, flicker or blanking, and any status or ack lines observed.
+      placeholder: Orientation, stability over 60 seconds, status/ack lines if any.
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+      description: Redacted diagnostics or log lines. Never paste tokens, secrets, or absolute private paths.
+    validations:
+      required: false
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      options:
+        - label: This report contains no tokens, secrets, USB serial numbers, or private paths.
+          required: true

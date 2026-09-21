@@ -1,0 +1,64 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.5.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install Python bridge deps
+        run: |
+          pip install -r bridge/requirements.txt
+          pip install pyinstaller==6.22.3
+      - name: Install Node deps
+        run: pnpm install --frozen-lockfile
+      # smoke.yml runs on the same tag push; these cheap gates keep a
+      # broken bridge out of a published artifact on their own.
+      - name: Hardware-free smokes (gate the build)
+        run: |
+          python tests/test_registry.py
+          python tests/test_protocol.py
+          python tests/test_bridge.py
+          node --check src/main.js
+      - name: Build sidecar exe
+        run: pyinstaller bridge\lcd_bridge.spec
+      - name: Stage sidecar for electron-builder
+        shell: cmd
+        run: |
+          if not exist resources mkdir resources
+          copy /Y dist\lcd_bridge.exe resources\lcd_bridge.exe
+      - name: Build NSIS installer (unsigned)
+        run: pnpm exec electron-builder --win nsis --publish never
+      - name: Checksums
+        shell: bash
+        run: |
+          setup=$(ls dist/*Setup*.exe | head -1)
+          test -n "$setup" || { echo "no Setup.exe produced"; exit 1; }
+          sha256sum "$setup" | tee checksums.txt
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          notes="docs/release-notes-${GITHUB_REF_NAME}.md"
+          test -f "$notes" || { echo "missing release notes: $notes"; exit 1; }
+          setup=$(ls dist/*Setup*.exe | head -1)
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file "$notes" \
+            "$setup" checksums.txt

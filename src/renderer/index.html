@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- CSP: no remote code, no inline scripts, no popups (also denied in main). -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'self'; form-action 'none'" />
+  <title>LyricVision LCD</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <main>
+    <h1>LyricVision LCD</h1>
+    <p class="subtitle">Spotify synced lyrics on your Thermalright USB LCD (v0.1)</p>
+
+    <section aria-label="Spotify connection">
+      <h2>Spotify</h2>
+      <label for="client-id">Client ID</label>
+      <input id="client-id" type="text" autocomplete="off" spellcheck="false" placeholder="Spotify app client ID" />
+      <button id="connect-btn" type="button">Connect Spotify</button>
+      <p id="spotify-state" role="status">Not connected.</p>
+    </section>
+
+    <section aria-label="LCD settings">
+      <h2>LCD</h2>
+      <label for="fps">Stream rate (FPS): <span id="fps-value">10</span></label>
+      <input id="fps" type="range" min="5" max="30" step="1" value="10" />
+      <label for="sync-offset">Lyric sync offset (seconds): <span id="sync-offset-value">0 ms</span></label>
+      <input id="sync-offset" type="range" min="-2" max="2" step="0.1" value="0" />
+      <!-- LV-09 unified: single view, nothing to choose (no layout selector).
+        Old `layout` values in settings.json are still accepted (compat) but ignored. -->
+      <label for="serial">USB serial (blank = first panel found)</label>
+      <input id="serial" type="text" autocomplete="off" spellcheck="false" placeholder="auto" />
+      <label class="row"><input id="startup" type="checkbox" /> Start with Windows</label>
+      <button id="save-btn" type="button">Save settings</button>
+      <button id="refresh-btn" type="button">Refresh now</button>
+      <p id="settings-state" role="status"></p>
+    </section>
+
+    <section aria-label="Status">
+      <h2>Status</h2>
+      <dl class="grid">
+        <dt>LCD panel</dt><dd id="st-panel">—</dd>
+        <dt>FPS / queue / frames</dt><dd id="st-stream">—</dd>
+        <dt>Track</dt><dd id="st-track">—</dd>
+        <dt>Lyric</dt><dd id="st-lyric">—</dd>
+        <dt>lcdStatus</dt><dd id="st-lcdstatus">—</dd>
+        <dt>Detail</dt><dd id="st-reason">—</dd>
+      </dl>
+    </section>
+
+    <section aria-label="TRCC and SignalRGB guide">
+      <h2>TRCC / SignalRGB</h2>
+      <p id="exclusivity-state">Checking…</p>
+      <p>
+        TRCC and SignalRGB open the LCD exclusively. Quit them fully before
+        LyricVision can claim the panel; otherwise the status above reports
+        the device as busy (blocked) instead of streaming.
+      </p>
+    </section>
+
+    <section aria-label="Diagnostics">
+      <h2>Diagnostics</h2>
+      <p>Status detail (<span id="st-lcdstatus-inline">—</span>) and a redacted snapshot for bug reports (no tokens or serials).</p>
+      <button id="diag-export-btn" type="button">Export diagnostics</button>
+      <p id="diag-state" role="status"></p>
+    </section>
+
+    <footer>
+      <button id="min-btn" type="button">Minimize</button>
+      <button id="hide-btn" type="button">Hide to tray</button>
+    </footer>
+  </main>
+  <script src="./renderer.js"></script>
+</body>
+</html>

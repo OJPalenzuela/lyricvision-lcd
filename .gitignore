@@ -1,0 +1,15 @@
+node_modules/
+dist/
+build/
+resources/
+*.log
+__pycache__/
+.venv/
+.atl/
+.codegraph/
+.engram/
+.env
+*.pem
+*.key
+coverage/
+odd/

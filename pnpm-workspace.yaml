@@ -1,0 +1,10 @@
+# pnpm-only repo (see package.json "packageManager" + "preinstall").
+# Build-script approvals live here (pnpm v12 reads this file, not the
+# legacy "pnpm" field in package.json). Recorded via
+# `pnpm approve-builds --all`, which keeps the `allowBuilds` map below.
+allowBuilds:
+  electron-winstaller: true
+# electron needs no entry: v44 ships no install script (the runtime
+# binary is fetched on demand via the `install-electron` bin).
+# electron-winstaller (transitive via electron-builder, Squirrel.Windows
+# vendor tools) does need approval. The v0.1 package target is nsis only.

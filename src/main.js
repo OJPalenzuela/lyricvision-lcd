@@ -916,6 +916,12 @@ function buildBridgeState(player, settings) {
   const safe = player && typeof player === 'object' ? player : {};
   const cfg = settings && typeof settings === 'object' ? settings : {};
   const layout = normalizeLayout(cfg.layout);
+  // Scene (S1-T7a): the sidecar's composed frame reads
+  // state.settings.scene, so this is the last mile. Re-validated here even
+  // though loadSettings already gated it: buildBridgeState also runs on raw
+  // objects, and an invalid scene must be OMITTED (never sent, never a
+  // partial) so the sidecar's fail-safe falls back to the lyrics view.
+  const sceneGate = hardening.validateScene(cfg.scene);
   const rawTrack =
     safe.track && typeof safe.track === 'object' ? safe.track : { title: 'Unknown Track', artist: '' };
   const track = { ...rawTrack };
@@ -935,7 +941,13 @@ function buildBridgeState(player, settings) {
     durationMs: safe.durationMs || 0,
     isPlaying: safe.isPlaying === true,
     layout,
-    settings: { lcdFps: clampFps(cfg.lcdFps), layout },
+    settings: {
+      lcdFps: clampFps(cfg.lcdFps),
+      layout,
+      // Undefined keys vanish in JSON.stringify, so the wire envelope
+      // carries `scene` only when this gate accepted it.
+      ...(sceneGate.ok ? { scene: sceneGate.scene } : {}),
+    },
   };
 }
 
@@ -1395,7 +1407,16 @@ function registerIpc() {
         // exit handler restarts it
       }
     }
-    if (accepted.lcdFps !== undefined || accepted.syncOffsetMs !== undefined || accepted.layout !== undefined) sendStateToBridge();
+    if (
+      accepted.lcdFps !== undefined ||
+      accepted.syncOffsetMs !== undefined ||
+      accepted.layout !== undefined ||
+      // Scene edits (S1-T7a) must reach the sidecar without waiting for
+      // the next poll tick.
+      accepted.scene !== undefined
+    ) {
+      sendStateToBridge();
+    }
     return { settings: next, rejected };
   });
 

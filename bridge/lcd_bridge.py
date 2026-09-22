@@ -838,6 +838,7 @@ def render_unified(
     state: Dict[str, Any],
     glass: Tuple[int, int] = DEFAULT_GLASS,
     now_ms: Optional[float] = None,
+    base=None,
 ):
     """Render the UNIFIED single view (LV-09 producto: el unico modo).
 
@@ -845,13 +846,29 @@ def render_unified(
     titulo/artista/album, linea actual (+ siguiente atenuada), icono
     play/pausa dibujado (nunca emoji), tiempo ``cur / total`` (m:ss) y barra
     proporcional. Sin arte nunca levanta. ``now_ms`` congela el reloj (tests).
+
+    ``base`` (S1-T7a): an OPTIONAL RGB canvas of exactly ``glass`` size to
+    draw onto instead of a fresh one -- this is how a scene background sits
+    UNDER this view (render_frame passes the flattened background). With
+    ``base=None`` (every existing caller) the output is byte-identical to
+    the pre-S1-T7a renderer: only the canvas acquisition differs. A base of
+    the wrong mode or size is IGNORED and a fresh canvas is built instead
+    -- fail-safe on the production path: the view the panel shows must
+    never depend on a compatibility check passing.
     """
     if Image is None:
         raise RuntimeError("Pillow is required for rendering (pip install Pillow)")
     w, h = glass
     model = extract_display(state, now_ms)
 
-    img = Image.new("RGB", (w, h), (10, 13, 20))
+    if (
+        base is not None
+        and getattr(base, "mode", None) == "RGB"
+        and getattr(base, "size", None) == (w, h)
+    ):
+        img = base
+    else:
+        img = Image.new("RGB", (w, h), (10, 13, 20))
     draw = ImageDraw.Draw(img)
     margin = 28
     max_w = w - 2 * margin
@@ -959,27 +976,94 @@ def render_unified(
     return img
 
 
+def _warn_scene_fallback(exc: BaseException) -> None:
+    """Surface a scene fallback on stderr, deduped (S1-T7a).
+
+    ``log`` writes to STDERR -- stdout is the JSONL protocol channel, and a
+    stray line there would be parsed as noise (or worse, as an envelope).
+    Deduped so a persistently broken scene logs once, not at lcdFps.
+    """
+    global _SCENE_FALLBACK_LAST
+    text = f"{type(exc).__name__}: {exc}"
+    if text != _SCENE_FALLBACK_LAST:
+        _SCENE_FALLBACK_LAST = text
+        log(f"scene disabled, showing lyrics view: {text}")
+
+
+_SCENE_FALLBACK_LAST: Optional[str] = None
+
+
+def _scene_from_state(state: Dict[str, Any]):
+    """Validated scene from state.settings.scene, or None for "no scene".
+
+    None means "render the legacy view": the key is absent (no scene
+    configured) OR stored invalid -- a bad value in settings.json must
+    never crash the loop or blank the panel (fail back, then surface via
+    _warn_scene_fallback). Validation here is validate_scene itself: the
+    sidecar never trusts the shell's gate (defense in depth, same rule the
+    preview path applies to wire input).
+    """
+    settings = state.get("settings") if isinstance(state, dict) else None
+    if not isinstance(settings, dict) or "scene" not in settings:
+        return None
+    scene = settings["scene"]
+    if scene is None:
+        return None
+    try:
+        return validate_scene(scene)
+    except ProtocolError as exc:
+        _warn_scene_fallback(exc)
+        return None
+
+
 def render_portrait(
     state: Dict[str, Any],
     glass: Tuple[int, int] = DEFAULT_GLASS,
     now_ms: Optional[float] = None,
+    frame_index: int = 0,
 ):
     """Render the portrait frame at glass resolution (default 480x854).
 
     LV-09 unified: SIEMPRE la vista unica (:func:`render_unified`); el
     ``layout`` guardado viejo se acepta (whitelist) pero se ignora.
+    S1-T7a: when ``state["settings"]["scene"]`` holds a USABLE scene the
+    frame is composed through :func:`render_frame` (background -> lyrics
+    view -> overlays). Absent, invalid or unusable scenes -- bad shape,
+    refused/missing/unreadable media, kinds not implemented yet (video,
+    gpu-temp) -- fall back to today's canvas, so a broken stored scene can
+    never blank the panel, hang, or push a traceback onto stdout.
     Mantiene la forma de llamada para no tocar el path USB/rotacion/encode.
     """
     _ = layout_from_state(state)  # compat: validate, ignore result
-    return render_unified(state, glass, now_ms)
+    scene = _scene_from_state(state)
+    if scene is None:
+        return render_unified(state, glass, now_ms)
+    try:
+        return render_frame(
+            state,
+            scene,
+            media_root=MEDIA_ROOT,
+            glass=glass,
+            now_ms=now_ms,
+            frame_index=frame_index,
+        )
+    except Exception as exc:
+        # Fail-safe (total contract): the composed path is the only NEW
+        # thing on the production frame path, so every failure it can raise
+        # -- typed media/validation errors, an unimplemented kind, even an
+        # unexpected one -- degrades to today's lyrics frame. Letting one
+        # escape would kill the sidecar and freeze the panel on the very
+        # user input (a stored scene) this wrapper exists to distrust.
+        _warn_scene_fallback(exc)
+        return render_unified(state, glass, now_ms)
 
 
 # ---------------------------------------------------------------------------
 # Scene renderer (S1-T4): backgrounds + transforms + text overlays.
 #
-# ADDITIVE by contract: the live frame loop still runs render_unified();
-# swapping it to render_scene is S1-T7 together with physical-hardware
-# validation. Nothing below is reachable from the USB path yet.
+# S1-T7a: the live loop reaches these layers through render_frame()
+# (background -> lyrics view -> overlays); render_scene() remains the
+# preview's single-call path and paints exactly the same layers.
 # ---------------------------------------------------------------------------
 
 # Bounds for untrusted scene input: `size` can ask for a full-canvas font
@@ -1014,20 +1098,20 @@ SCENE_MAX_GIF_DIM = 4096
 
 # Refresh-policy sentinels (S1-T5, scene_refresh_ms below). FAIL-SAFE
 # INVARIANT: every value here is a finite positive integer -- never 0,
-# never negative, never infinity/NaN. 0 or negative would make the future
-# S1-T7 loop busy-spin; infinity or NaN would corrupt the now+wait
-# deadline arithmetic into an overflow or a non-deadline. The static case
-# genuinely needs no SCENE refresh, so its sentinel is LARGE (1 hour): if
-# the "static" verdict were ever wrong, the worst case is a FROZEN panel
-# -- the last rendered frame stays visible until the next real event. A
+# never negative, never infinity/NaN. 0 or negative would make a wired-in
+# loop busy-spin; infinity or NaN would corrupt the now+wait deadline
+# arithmetic into an overflow or a non-deadline. The static case genuinely
+# needs no SCENE refresh, so its sentinel is LARGE (1 hour): if the
+# "static" verdict were ever wrong, the worst case is a FROZEN panel --
+# the last rendered frame stays visible until the next real event. A
 # frozen panel is visible and reportable; a spin or an overflow is not.
-# SCOPE CAVEAT: this answers "when does the SCENE change", not "when do
-# PIXELS change". Production pixels also come from state (lyric line, the
-# progress clock that ticks every second) and from the GIF frame selector,
-# none of which the scene digest sees. Wiring this in WITHOUT composing it
-# with a state digest WOULD freeze live lyrics behind a static background,
-# so S1-T7 must key on scene_digest || display-state digest || frame_index
-# || a time bucket, never on this alone.
+# COMPOSITE BEHAVIOR (S1-T7a): this sentinel is only the SCENE component.
+# frame_refresh_ms composes it with REFRESH_PLAYING_MS by MINIMUM, and
+# composite_frame_key composes scene_digest with the display-state digest,
+# frame_index and the displayed-second time bucket -- so live lyrics and
+# the extrapolated progress clock can never be frozen by a static scene
+# (proven in tests/test_compose_frame.py, the S1-T5 verifier's binding
+# acceptance criterion).
 REFRESH_STATIC_MS = 60 * 60 * 1000
 # gpu-temp overlay: sensor values move about once a second.
 REFRESH_SENSOR_MS = 1000
@@ -1035,6 +1119,15 @@ REFRESH_SENSOR_MS = 1000
 # exposes the container's per-frame timing. Finite and small on purpose:
 # a wired-in loop would degrade to frequent cheap checks, never to freeze.
 REFRESH_VIDEO_MS = 33
+# While PLAYING, the extrapolated m:ss clock changes every second and the
+# progress bar keeps moving with NO state change, so the scene's own
+# verdict (possibly the 1-hour sentinel) must be bounded: 250 ms = 4 checks
+# per displayed second, so the composite key's bucket change (it IS the
+# displayed seconds field) is observed within 250 ms of occurring. The bar
+# advances one pixel per (duration/424) ms, so every single bar-pixel
+# transition is observed for tracks >= 106 s; shorter tracks may merge a
+# couple of pixels into one 250 ms step -- a visible jump, never a freeze.
+REFRESH_PLAYING_MS = 250
 
 
 class SceneRenderError(Exception):
@@ -1337,10 +1430,26 @@ def render_scene(scene, *, media_root, size=(480, 854), frame_index: int = 0):
         still validate but are not implemented (S3-T12): they raise
         SceneRenderError("unsupported_*") so the caller can tell
         "unsupported" from "invalid" (ProtocolError from validate_scene).
-      * ADDITIVE: not wired into the live frame loop (S1-T7, hardware).
+      * S1-T7a: the live loop composes the LAYERS below
+        (render_scene_background + draw_scene_overlays) through
+        render_frame; this single-call path stays the preview's engine
+        and paints byte-identical pixels to the recomposed layers.
     """
     if Image is None:
         raise RuntimeError("Pillow is required for rendering (pip install Pillow)")
+    _require_canvas_size(size)
+    _validate_frame_index(frame_index)
+    # Defense in depth: validation errors are ProtocolError, never
+    # SceneRenderError -- the two families stay disjoint for callers.
+    validated = validate_scene(scene)
+    w, h = size
+    canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    _paint_scene_background(canvas, validated, media_root, frame_index)
+    _paint_scene_overlays(canvas, validated)
+    return canvas
+
+
+def _require_canvas_size(size) -> None:
     if not (
         isinstance(size, tuple)
         and len(size) == 2
@@ -1349,18 +1458,16 @@ def render_scene(scene, *, media_root, size=(480, 854), frame_index: int = 0):
         )
     ):
         raise ValueError("size must be a (width, height) tuple of positive ints")
-    _validate_frame_index(frame_index)
-    # Defense in depth: validation errors are ProtocolError, never
-    # SceneRenderError -- the two families stay disjoint for callers.
-    validated = validate_scene(scene)
-    w, h = size
-    canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+
+
+def _paint_scene_background(canvas, validated, media_root, frame_index) -> None:
+    """Background dispatch on an ALREADY validated scene (S1-T7a split)."""
     background = validated["background"]
     kind = background["kind"]
     if kind == "none":
         pass  # a transparent canvas IS the background
     elif kind == "color":
-        canvas.paste(_hex_rgb(background["color"]) + (255,), (0, 0, w, h))
+        canvas.paste(_hex_rgb(background["color"]) + (255,), (0, 0, canvas.size[0], canvas.size[1]))
     elif kind == "image":
         _render_image_background(canvas, background, media_root)
     elif kind == "gif":
@@ -1375,6 +1482,10 @@ def render_scene(scene, *, media_root, size=(480, 854), frame_index: int = 0):
             "(video: S3-T12)",
             field="background.kind",
         )
+
+
+def _paint_scene_overlays(canvas, validated) -> None:
+    """Overlay dispatch on an ALREADY validated scene (S1-T7a split)."""
     for index, overlay in enumerate(validated["overlays"]):
         overlay_kind = overlay["kind"]
         if overlay_kind == "text":
@@ -1388,7 +1499,39 @@ def render_scene(scene, *, media_root, size=(480, 854), frame_index: int = 0):
                 "render_scene yet",
                 field=f"overlays[{index}].kind",
             )
+
+
+def render_scene_background(scene, *, media_root, size=(480, 854), frame_index: int = 0):
+    """Background-only RGBA layer -- render_scene minus its overlay pass (S1-T7a).
+
+    Same validation, same frame selector, same paint code as render_scene,
+    so ``draw_scene_overlays(render_scene_background(s), s)`` is
+    byte-identical to ``render_scene(s)`` (pinned in
+    tests/test_compose_frame.py). This is the layer that sits UNDER the
+    lyrics view in render_frame; the preview keeps using render_scene.
+    """
+    if Image is None:
+        raise RuntimeError("Pillow is required for rendering (pip install Pillow)")
+    _require_canvas_size(size)
+    _validate_frame_index(frame_index)
+    validated = validate_scene(scene)
+    w, h = size
+    canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    _paint_scene_background(canvas, validated, media_root, frame_index)
     return canvas
+
+
+def draw_scene_overlays(canvas, scene) -> None:
+    """Paint a scene's overlays onto an EXISTING image (top layer, S1-T7a).
+
+    `canvas` must be RGBA: overlay ink alpha-blends with whatever is
+    beneath it (Image.alpha_composite requirement), and its SIZE defines
+    the 0-1 fraction space the overlay coordinates resolve against.
+    Validation runs here too -- this is a public door, and an untrusted
+    scene must never reach the painter. Mutates `canvas`, returns None.
+    """
+    validated = validate_scene(scene)
+    _paint_scene_overlays(canvas, validated)
 
 
 def _validate_frame_index(frame_index: Any) -> int:
@@ -1571,19 +1714,17 @@ def _render_gif_background(
 
 
 # ---------------------------------------------------------------------------
-# scene_digest / scene_refresh_ms (S1-T5): dirty-flag machinery. Pure and
-# ADDITIVE -- the live loop still runs a blind 1/fps cadence; wiring this in
-# is S1-T7 together with physical-hardware validation.
-# INDEPENDENT-VERIFICATION FINDING (recorded here rather than hidden):
-# both functions are SCENE-ONLY. render_unified draws the lyric line, a
-# progress clock that ticks every second, title/artist/artwork and the
-# play icon -- all from state -- and an animating GIF's scene digest is
-# constant across frames. So these are a correct COMPONENT of a dirty key,
-# never the whole key: S1-T7 must compose scene_digest with a digest of
-# the display-relevant state subset, with frame_index, and with a time
-# bucket for progress extrapolation, and must prove it with a test where
-# the scene is static while lyric.current_line / progressMs change and the
-# panel still re-renders. Using either function alone freezes live lyrics.
+# scene_digest / scene_refresh_ms (S1-T5): SCENE-ONLY dirty-flag COMPONENTS.
+# Pure. INDEPENDENT-VERIFICATION FINDING (S1-T5, RESOLVED by S1-T7a): on
+# their own both functions are a correct component of a dirty key, never
+# the whole key -- render_unified draws the lyric line, a progress clock
+# that ticks every second, title/artist/artwork and the play icon from
+# state, and an animating GIF's scene digest is constant across frames.
+# Wiring either ALONE freezes live lyrics behind a static background.
+# composite_frame_key / frame_refresh_ms below compose these with the
+# display-state digest, frame_index and the displayed-second time bucket;
+# the binding test (static scene while lyric.current_line and progressMs
+# change, frame still dirties) lives in tests/test_compose_frame.py.
 # ---------------------------------------------------------------------------
 
 
@@ -1635,6 +1776,190 @@ def scene_refresh_ms(scene, *, media_root, frame_index: int = 0) -> int:
     if any(overlay["kind"] == "gpu-temp" for overlay in validated["overlays"]):
         wait = min(wait, REFRESH_SENSOR_MS)
     return wait
+
+
+# ---------------------------------------------------------------------------
+# Composition (S1-T7a): background -> lyrics view -> overlays, plus the
+# composite dirty key and refresh policy that keep the live loop honest.
+# ---------------------------------------------------------------------------
+
+
+def render_frame(
+    state,
+    scene,
+    *,
+    media_root,
+    glass=DEFAULT_GLASS,
+    now_ms=None,
+    frame_index=0,
+):
+    """Compose ONE production frame: background -> lyrics view -> overlays.
+
+    LAYER ORDER CONTRACT (why, not what): the scene background is the
+    BOTTOM canvas -- it is what the user picked to sit behind everything;
+    the lyrics view (render_unified) draws OVER it because it owns the
+    glass layout (art, metadata, lyric lines, progress bar) and a scene
+    must never hide live lyrics; scene text overlays draw LAST because the
+    user placed them on top of the view -- matching the preview, where
+    render_scene paints background then overlays over the same two layers.
+    The lyrics view paints an OPAQUE canvas of its own when given no base,
+    which is exactly why it must RECEIVE the flattened background as
+    `base` instead of being drawn before it.
+
+    scene=None is the "no scene" path and yields render_unified's exact
+    bytes. Typed failures (invalid scene -> ProtocolError, refused or
+    unreadable media -> SceneRenderError, unimplemented kinds) propagate
+    by design: render_portrait is the fail-safe wrapper that degrades them
+    to the legacy frame; direct callers handle them. `media_root` is the
+    ONLY filesystem door -- identical containment to the preview path.
+    """
+    if scene is None:
+        return render_unified(state, glass, now_ms)
+    background = render_scene_background(
+        scene, media_root=media_root, size=glass, frame_index=frame_index
+    )
+    # Flatten the RGBA background over today's canvas color (10, 13, 20).
+    # alpha_composite at alpha 0 is identity, so a `none` background lands
+    # on EXACTLY the legacy canvas -- the blank-scene frame is therefore
+    # byte-identical to the pre-scene renderer, pixel for pixel.
+    w, h = glass
+    base = Image.alpha_composite(
+        Image.new("RGBA", (w, h), (10, 13, 20) + (255,)), background
+    ).convert("RGB")
+    view = render_unified(state, glass, now_ms, base=base)
+    # Presence probe only (cheap short-circuit for the common empty case);
+    # draw_scene_overlays re-validates authoritatively below. By here the
+    # scene is known-dict-valid (render_scene_background validated it).
+    if not scene.get("overlays"):
+        return view
+    # RGB -> RGBA -> RGB: overlay ink must alpha-blend with BOTH layers
+    # beneath it, and the JPEG path wants RGB back. With no overlays this
+    # round-trip is skipped entirely, preserving the exact legacy bytes.
+    layered = view.convert("RGBA")
+    draw_scene_overlays(layered, scene)
+    return layered.convert("RGB")
+
+
+# Token for "no scene configured" in the composite key: one stable value,
+# so the absent-scene case still composes a full key (never a short-circuit
+# that would skip the state/bucket components).
+NO_SCENE_DIGEST = "no-scene"
+
+
+def display_state_digest(state, *, now_ms=None) -> str:
+    """Stable hash of the DISPLAY-RELEVANT state subset (S1-T7a).
+
+    * extract FIRST through extract_display -- the one function whose
+      output render_unified paints from -- so everything the lyrics view
+      reads is in the key BY CONSTRUCTION: title/artist/album/artworkUrl,
+      the current/next pair INCLUDING the track.lyrics.syncedLyrics
+      fallback derived from raw progressMs, durationMs, isPlaying.
+      `layout` is deliberately absent: it is accepted and ignored at
+      render time, so it must not dirty the panel.
+    * The raw clock inputs are added on top (progressMs at state and track
+      scope, offsetMs, measuredAt/updatedAt): the digest must be sensitive
+      to every state change that CAN move pixels, even when the rendered
+      value is momentarily unchanged.
+    * settings.lcdFps is included: it changes the stream cadence.
+    * NOT the wall clock: the extrapolated m:ss is intentionally excluded
+      (the time bucket in composite_frame_key owns time). `now_ms` is
+      forwarded to extract_display so extraction matches the render call;
+      none of the hashed fields depends on it.
+    * sort_keys: JSON key insertion order must never dirty the panel.
+      `default=str` normalizes any out-of-band value instead of raising --
+      over-sensitivity (a spurious refresh) is safe, a crash is not.
+    """
+    model = extract_display(state, now_ms)
+    track = state.get("track") if isinstance(state.get("track"), dict) else {}
+    settings = (
+        state.get("settings") if isinstance(state.get("settings"), dict) else {}
+    )
+    subset = {
+        # What the lyrics view paints (extract_display's output):
+        "title": model["title"],
+        "artist": model["artist"],
+        "album": model["album"],
+        "artworkUrl": model["artworkUrl"],
+        "current": model["current"],
+        "next": model["next"],
+        "isPlaying": model["isPlaying"],
+        "durationMs": model["durationMs"],
+        # Raw inputs behind the extrapolated clock and the derived pair:
+        "progressMs": state.get("progressMs"),
+        "trackProgressMs": track.get("progressMs"),
+        "offsetMs": state.get("offsetMs"),
+        "measuredAt": state.get("measuredAt"),
+        "updatedAt": state.get("updatedAt"),
+        # Stream cadence:
+        "lcdFps": settings.get("lcdFps"),
+    }
+    canonical = json.dumps(subset, sort_keys=True, separators=(",", ":"),
+                           default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def composite_frame_key(state, scene, *, now_ms=None, frame_index=0) -> str:
+    """scene digest || state digest || frame_index || time bucket (S1-T7a).
+
+    The BINDING composition (S1-T5 verifier MAJOR): scene_digest alone is
+    SCENE-ONLY -- live lyrics, artwork, the play icon and the extrapolated
+    m:ss clock all keep moving with a static scene, and a GIF's scene
+    digest is constant across frames. Components:
+      * scene: scene_digest(scene); scene=None (none configured) uses
+        NO_SCENE_DIGEST so the "no scene" case still composes fully.
+      * state: display_state_digest -- every display-relevant value.
+      * frame_index: separates GIF frames the scene digest cannot see.
+      * TIME BUCKET = floor(extrapolated_progress_ms / 1000) -- literally
+        the SECONDS FIELD format_time() renders. The key therefore changes
+        if and only when the displayed clock can change: any two
+        samples on opposite sides of a bucket boundary differ (a tick is
+        observed), and two samples inside one bucket show the same
+        displayed second (no tick happened in between). It cannot miss a
+        second by construction. The bucket rides the RENDERED value, not
+        wall time: an epoch-aligned bucket would misalign with a clock
+        whose extrapolation starts at measuredAt (+ offsetMs). While
+        paused the extrapolation is frozen, so the bucket is frozen too --
+        a stopped clock dirties nothing and the static sentinel stands.
+    The scene is validated first (ProtocolError), same family as
+    scene_digest: an invalid scene never compares "unchanged" against
+    another invalid scene.
+    """
+    scene_part = NO_SCENE_DIGEST if scene is None else scene_digest(scene)
+    state_part = display_state_digest(state, now_ms=now_ms)
+    bucket = int(current_progress(state, now_ms) // 1000)
+    return f"{scene_part}|{state_part}|{frame_index}|{bucket}"
+
+
+def frame_refresh_ms(state, scene, *, media_root, now_ms=None, frame_index=0) -> int:
+    """Milliseconds until the COMPOSED frame must be re-rendered (S1-T7a).
+
+    The scene verdict and the playback verdict combine by MINIMUM -- the
+    most urgent driver wins, and the policy never UNDER-refreshes:
+      * scene component: scene_refresh_ms (gif -> that frame's own delay,
+        video -> REFRESH_VIDEO_MS, gpu-temp -> REFRESH_SENSOR_MS, static
+        -> REFRESH_STATIC_MS); scene=None counts as static.
+      * playback component: while playing the extrapolated m:ss clock and
+        the bar keep moving with NO state change, so the scene's possibly
+        1-hour verdict is bounded to REFRESH_PLAYING_MS (see why on that
+        constant). Paused playback adds no pressure -- the extrapolation
+        is frozen -- and the static sentinel stands.
+    RETURN CONTRACT (FAIL-SAFE): always a finite positive int -- never 0,
+    negative, float, inf or NaN (see the REFRESH_* invariant comment).
+    Invalid scene -> ProtocolError, same family as scene_refresh_ms; a
+    gif's delay is read through the same containment door the renderer
+    uses, so media errors surface as SceneRenderError, never as a silent
+    guess.
+    """
+    wait = (
+        REFRESH_STATIC_MS
+        if scene is None
+        else scene_refresh_ms(scene, media_root=media_root, frame_index=frame_index)
+    )
+    track = state.get("track") if isinstance(state.get("track"), dict) else {}
+    is_playing = bool(state.get("isPlaying", track.get("isPlaying", False)))
+    if is_playing:
+        wait = min(wait, REFRESH_PLAYING_MS)
+    return int(wait)
 
 
 def portrait_to_buffer(portrait, rotation: str):

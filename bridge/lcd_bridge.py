@@ -1020,7 +1020,7 @@ def render_portrait(
     state: Dict[str, Any],
     glass: Tuple[int, int] = DEFAULT_GLASS,
     now_ms: Optional[float] = None,
-    frame_index: int = 0,
+    frame_index: Optional[int] = None,
 ):
     """Render the portrait frame at glass resolution (default 480x854).
 
@@ -1032,6 +1032,9 @@ def render_portrait(
     refused/missing/unreadable media, kinds not implemented yet (video,
     gpu-temp) -- fall back to today's canvas, so a broken stored scene can
     never blank the panel, hang, or push a traceback onto stdout.
+    S1-T7a-1: ``frame_index=None`` (the default, and everything the live
+    loop passes) derives the GIF frame from ``now_ms`` through
+    gif_frame_index_at; an explicit int still pins the selector.
     Mantiene la forma de llamada para no tocar el path USB/rotacion/encode.
     """
     _ = layout_from_state(state)  # compat: validate, ignore result
@@ -1039,13 +1042,27 @@ def render_portrait(
     if scene is None:
         return render_unified(state, glass, now_ms)
     try:
+        # S1-T7a-1 (verified defect): the live loop passes NO frame_index,
+        # so relying on render_scene's default would pin every GIF to
+        # frame 0 forever on the panel while the preview animated. The
+        # loop still wakes on the blind time.sleep(1.0 / fps) cadence (the
+        # refresh-policy wake-up is deferred with the wake-on-state piece),
+        # so the animation advances at lcdFps GRANULARITY -- ~100 ms per
+        # tick at the default 10 fps -- NOT at the GIF's own per-frame
+        # delays. That is expected and correct here: we do not control
+        # when the loop wakes yet, only WHICH frame a wake shows.
+        resolved_frame = (
+            frame_index
+            if frame_index is not None
+            else gif_frame_index_at(scene, MEDIA_ROOT, now_ms)
+        )
         return render_frame(
             state,
             scene,
             media_root=MEDIA_ROOT,
             glass=glass,
             now_ms=now_ms,
-            frame_index=frame_index,
+            frame_index=resolved_frame,
         )
     except Exception as exc:
         # Fail-safe (total contract): the composed path is the only NEW
@@ -1664,6 +1681,37 @@ def _gif_delay(handle) -> int:
     return GIF_DEFAULT_DELAY_MS
 
 
+def _gif_delays(handle, count: int, source: str) -> list[int]:
+    """Every frame's delay in ms for one full loop -- the selector's clock.
+
+    Built by walking the frames through the SAME _gif_select seek and the
+    SAME _gif_delay floor that render_scene and scene_refresh_ms already
+    use, so the time->index selector can never disagree with the renderer
+    or the refresh policy about how long a frame lasts: no duplicated
+    constant, no second derivation of the delay rule. Ascending indexes on
+    a fresh handle are forward seeks only.
+
+    COST (measured, not assumed -- an earlier comment here wrongly called
+    this header-only): the delay READ is header-only (handle.info), but
+    _gif_select decodes and composites each frame it lands on, so the
+    walk's time tracks DECODED PIXELS, not file bytes -- 16x the frame
+    pixels measured 9.4x the walk time while an 18x byte difference at
+    constant pixels changed nothing. A panel-resolution, many-frame GIF
+    can therefore push one walk past the 100 ms lcdFps budget near
+    SCENE_MAX_GIF_FRAMES. This is bounded and degrades smoothly (the
+    sleep follows the render, so over-budget ticks simply lower the
+    effective fps with no backlog), and it runs ONCE per tick, not once
+    per boundary. Memoizing this table per file is a known, still-open
+    optimization -- not yet done, because nothing has measured it as a
+    real user-visible problem on hardware.
+    """
+    delays = []
+    for index in range(count):
+        _gif_select(handle, count, index, source)
+        delays.append(_gif_delay(handle))
+    return delays
+
+
 def _gif_open_frame(source: str, media_root: Any, frame_index: int, *, rgba: bool):
     """Select ONE frame of one GIF: shared by render and refresh policy.
 
@@ -1776,6 +1824,79 @@ def scene_refresh_ms(scene, *, media_root, frame_index: int = 0) -> int:
     if any(overlay["kind"] == "gpu-temp" for overlay in validated["overlays"]):
         wait = min(wait, REFRESH_SENSOR_MS)
     return wait
+
+
+def _live_clock_ms() -> float:
+    """The live wall clock in epoch ms -- what now_ms=None means.
+
+    Same convention current_progress documents ("now_ms defaults to the
+    live clock; tests freeze it"). Factored into a named helper so tests
+    can freeze it through monkeypatch instead of patching the time module.
+    """
+    return time.time() * 1000.0
+
+
+def gif_frame_index_at(scene, media_root, now_ms=None) -> int:
+    """Which GIF frame should be showing at ``now_ms`` -- pure time->index.
+
+    The GIF loop is PERIODIC: the per-frame delays sum to ``loop_ms``, so
+    the frame on screen depends only on ``phase = now_ms % loop_ms``.
+    That is the whole design -- no "scene started at" bookkeeping, no
+    module-global mutable start time (a render path must not hold clock
+    state that races with preview requests), no accumulated drift:
+    identical ``now_ms`` always yields the identical index, which is what
+    render_scene's determinism contract demands of a selector.
+
+    Contract:
+      * non-GIF scene (none/color/image/video): 0, WITHOUT opening any
+        file -- the common path pays a dict check and nothing else.
+      * delays come from _gif_delays (_gif_select + _gif_delay): the SAME
+        seek and the SAME floor render_scene and scene_refresh_ms use, so
+        all three can never disagree about a frame's length.
+        Missing/zero durations floor to GIF_DEFAULT_DELAY_MS, so a real
+        loop_ms is always > 0; an empty or non-positive list (defensive
+        only) returns 0 -- never a ZeroDivisionError.
+      * BOUNDARY RULE: half-open intervals [start, end) -- a phase landing
+        EXACTLY on a boundary selects the NEW frame, because at that
+        instant the previous frame's delay has fully elapsed. Every
+        instant then maps to exactly one frame (no double ownership), and
+        the walk is "advance when the delay expires".
+      * ``now_ms=None`` -> the live clock (_live_clock_ms). Float, huge
+        and NEGATIVE stamps are accepted: Python's % wraps the phase into
+        [0, loop_ms) -- the same periodic rule, no special-cased branch --
+        and the modulo is O(1) whatever the magnitude. Garbage that cannot
+        name a phase (bool/str/inf/NaN) -> frame 0: fail-safe, never an
+        exception on the render path.
+      * Invalid scene -> ProtocolError, same family as scene_refresh_ms.
+    """
+    validated = validate_scene(scene)
+    if validated["background"]["kind"] != "gif":
+        return 0
+    if now_ms is None:
+        now = _live_clock_ms()
+    else:
+        coerced = _finite_float(now_ms)
+        now = 0.0 if coerced is None else coerced
+    source = validated["background"]["source"]
+    payload = _load_media_bytes(source, media_root,
+                                max_bytes=SCENE_MAX_GIF_BYTES)
+    handle, count = _open_gif(payload, source)
+    try:
+        delays = _gif_delays(handle, count, source)
+    finally:
+        handle.close()
+    loop_ms = sum(delays)
+    if loop_ms <= 0:
+        return 0
+    phase = now % loop_ms
+    elapsed = 0
+    for index, delay in enumerate(delays):
+        elapsed += delay
+        if phase < elapsed:
+            return index
+    # Unreachable for a positive loop (phase < loop_ms always holds):
+    # defensive, and frame 0 is the same fail-safe a garbage stamp gets.
+    return 0
 
 
 # ---------------------------------------------------------------------------

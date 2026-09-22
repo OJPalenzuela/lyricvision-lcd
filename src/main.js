@@ -1518,6 +1518,7 @@ module.exports = {
   detectExclusivityHolders,
   computeLcdStatus,
   bridgeStatusLine,
+  handleBridgeLine,
   getLcdStatus,
   buildDiagnosticsPayload,
   diagnosticsFilePath,

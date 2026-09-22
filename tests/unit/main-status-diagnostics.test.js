@@ -418,3 +418,118 @@ describe('createTray', () => {
     // assertion; invoking it would violate the no-network constraint.
   });
 });
+
+describe('handleBridgeLine (WARNING 2 follow-up: the lastBridgeStatus writer)', () => {
+  // TDD: this describe is the RED for a one-line export-hook addition.
+  // Before `handleBridgeLine` joins the module.exports block every test
+  // here fails (not a function); after, all pass with no production-
+  // behavior change (additive export only).
+  //
+  // Honest boundary (verified, not assumed): driving the writer stores the
+  // status line and pushes it to the renderer, but computeLcdStatus STILL
+  // returns offline headless — the `!bridgeChild` guard (src/main.js:1076)
+  // fires before any status-driven branch. Of the 6 LcdStatusKind values
+  // only `offline` gets richer (stored line + renderer lcd payload); the
+  // other 5 stay uncovered — but NOT because hardware or network is
+  // required. Each is gated on a module-scoped variable whose writer the
+  // module.exports hook (src/main.js:1486-1528) simply does not expose:
+  // - ok / degraded (queue>=20, :1086) / degraded (exclusivity, :1089) /
+  //   degraded (poll error, :1090) / bridge-wedged (:1078): all sit below
+  //   the !bridgeChild guard; `bridgeChild` is written only by
+  //   startBridge() (:979), which is not exported. Stubbing
+  //   `./bridge-spawn` (:27) plus one additive export reaches them.
+  // - panel-unknown (:1060): needs lastBridgeExit.code === 2 from the
+  //   child 'exit' handler (:1007) — a fake child emitting exit 2, no panel.
+  // - auth-error (:1059): needs authBroken=true from pollNow() (:615,
+  //   :638) — a stubbed token path, no Spotify round-trip.
+  // Closing them is a test-scaffolding follow-up (additive export + module
+  // stubs), never a production logic change; until then the five kinds are
+  // reported as still-open, not faked.
+
+  it('is exposed through the module.exports test hook', () => {
+    expect(typeof main.handleBridgeLine).toBe('function');
+  });
+
+  it('stores status lines so bridgeStatusLine + the renderer lcd payload carry panel fields', () => {
+    delete process.env.ELECTRON_RENDERER_URL;
+    main.createWindow();
+    const win = browserWindows[browserWindows.length - 1];
+    try {
+      const before = win.sent.length;
+      // Shape mirrors the sidecar's per-frame emit
+      // (bridge/lcd_bridge.py: panel, pm/sub, fps, queue, frames).
+      main.handleBridgeLine(
+        JSON.stringify({
+          type: 'status',
+          panel: 'Vision MAX',
+          pm: 'PM-TEST',
+          sub: 'SUB-TEST',
+          fps: 10,
+          queue: 3,
+          frames: 42,
+        })
+      );
+      expect(main.bridgeStatusLine()).toMatchObject({
+        type: 'status',
+        panel: 'Vision MAX',
+        queue: 3,
+        frames: 42,
+      });
+      // The status path ends in pushPlayerState (~1 Hz is fine): the
+      // renderer learns the panel identity with no USB in the test.
+      expect(win.sent.length).toBe(before + 1);
+      const pushed = win.sent[win.sent.length - 1];
+      expect(pushed.channel).toBe('player-state');
+      expect(pushed.payload.lcd).toMatchObject({
+        panel: 'Vision MAX',
+        fps: 10,
+        queue: 3,
+        frames: 42,
+      });
+      expect(pushed.payload.spotify).not.toHaveProperty('accessToken');
+    } finally {
+      win.destroy();
+    }
+  });
+
+  it('ignores non-JSON stdout and lets acks pass without clobbering the status', () => {
+    main.handleBridgeLine(
+      JSON.stringify({
+        type: 'status',
+        panel: 'Vision MAX',
+        pm: 'PM-TEST',
+        sub: 'SUB-TEST',
+        fps: 10,
+        queue: 3,
+        frames: 42,
+      })
+    );
+    const stored = main.bridgeStatusLine();
+    expect(() => main.handleBridgeLine('not json {{')).not.toThrow();
+    expect(() => main.handleBridgeLine(JSON.stringify({ type: 'ack', seq: 3 }))).not.toThrow();
+    expect(main.bridgeStatusLine()).toBe(stored);
+    expect(main.bridgeStatusLine()).toMatchObject({ queue: 3, frames: 42 });
+  });
+
+  it('still reports offline headless: a degraded-shaped line cannot pass the !bridgeChild guard', () => {
+    // queue 25 WOULD hit the degraded branch (src/main.js:1086) under a
+    // live child; headless the guard at :1076 fires first. This pins the
+    // boundary so a future branch reorder fails loudly instead of
+    // silently claiming degraded coverage.
+    main.handleBridgeLine(
+      JSON.stringify({
+        type: 'status',
+        panel: 'Vision MAX',
+        pm: 'PM-TEST',
+        sub: 'SUB-TEST',
+        fps: 10,
+        queue: 25,
+        frames: 100,
+      })
+    );
+    expect(main.bridgeStatusLine()).toMatchObject({ queue: 25 });
+    const status = main.computeLcdStatus();
+    expect(status.status).toBe('offline');
+    expect(status.reason).toBe('bridge not running');
+  });
+});

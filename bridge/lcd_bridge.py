@@ -19,6 +19,7 @@ Human logs go to stderr. Exit codes: 0 ok, 2 unknown panel, 3 busy/absent.
 from __future__ import annotations
 
 import argparse
+import base64
 import io
 import json
 import math
@@ -28,6 +29,7 @@ import struct
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 from collections import OrderedDict
 from typing import Any, Dict, Optional, Tuple
@@ -49,6 +51,7 @@ from bridge.protocol import (  # noqa: E402
     parse_handshake,
     parse_json_object,
     validate_preview_request,
+    validate_scene,
 )
 from panels.registry import PanelProfile, lookup  # noqa: E402
 
@@ -878,6 +881,335 @@ def render_portrait(
     """
     _ = layout_from_state(state)  # compat: validate, ignore result
     return render_unified(state, glass, now_ms)
+
+
+# ---------------------------------------------------------------------------
+# Scene renderer (S1-T4): backgrounds + transforms + text overlays.
+#
+# ADDITIVE by contract: the live frame loop still runs render_unified();
+# swapping it to render_scene is S1-T7 together with physical-hardware
+# validation. Nothing below is reachable from the USB path yet.
+# ---------------------------------------------------------------------------
+
+# Bounds for untrusted scene input: `size` can ask for a full-canvas font
+# and `text` is any string, so without caps a single overlay could ask PIL
+# to allocate gigabytes. Checked BEFORE any layer is allocated.
+SCENE_MAX_TEXT_CHARS = 4096
+SCENE_MAX_LAYER_DIM = 4096
+# Scaled/rotated background cap: beyond a few canvas widths the 480x854
+# glass cannot show more detail, but an unbounded `scale` would still make
+# PIL build the full intermediate image.
+SCENE_MAX_IMAGE_DIM = 4096
+_TEXT_LAYER_PAD = 4
+
+
+class SceneRenderError(Exception):
+    """Typed scene-rendering failure (S1-T4).
+
+    Deliberately disjoint from ProtocolError (validation: "the scene is
+    malformed") and from OSError (filesystem: never allowed to leak from
+    this renderer). ``reason`` is the greppable discriminator:
+
+      unsupported_background  valid kind, not implemented yet (gif/video)
+      unsupported_overlay     valid kind, not implemented yet (gpu-temp)
+      media_refused           source resolves outside the media root
+      media_missing           contained key is not a regular file
+      media_unreadable        bytes would not decode as an image
+      text_too_long           text exceeds the caps above
+    """
+
+    def __init__(self, reason: str, message: str, field: Optional[str] = None):
+        super().__init__(message)
+        self.reason = reason
+        self.message = message
+        self.field = field
+
+
+def _hex_rgb(color: str) -> Tuple[int, int, int]:
+    # validate_scene already pinned the #rrggbb shape; this only expands it.
+    return (int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16))
+
+
+def _decode_data_url(source: str) -> bytes:
+    """Decode a data: URL inline. No filesystem access, by definition."""
+    header, separator, payload = source.partition(",")
+    if not separator:
+        raise SceneRenderError(
+            "media_unreadable",
+            "data: URL is missing its ',' separator",
+            field="background.source",
+        )
+    try:
+        if ";base64" in header.lower():
+            # validate=True: strict base64 keeps decode deterministic instead
+            # of silently ignoring stray characters.
+            return base64.b64decode(payload, validate=True)
+        return urllib.parse.unquote_to_bytes(payload)
+    except ValueError as exc:
+        # binascii.Error is a ValueError: a non-decodable payload is a data
+        # problem, never an internal fault.
+        raise SceneRenderError(
+            "media_unreadable",
+            f"data: URL payload does not decode: {exc}",
+            field="background.source",
+        ) from exc
+
+
+def _resolve_media_source(source: str, media_root: Any) -> str:
+    """Resolve `source` as a key inside `media_root`, or refuse it.
+
+    Security contract: validation (validate_scene) only rejects NUL and
+    ".." segments -- it deliberately accepts every string this function
+    must refuse. Containment is enforced HERE, at read time, on the
+    RESOLVED path: absolute/UNC/drive-relative forms and "file://"-style
+    schemes are refused before join(), and realpath() resolves
+    symlink/junction escapes so the final prefix check runs on canonical
+    paths. Never trust the validated string as a path by itself.
+    """
+    if "\x00" in source or source.startswith(("\\", "/")) or ":" in source:
+        # Covers UNC (\\server\share), POSIX/drive-rooted (/etc/passwd),
+        # "C:..." drive forms and "file://"/"http://" schemes in one rule.
+        # ':' is illegal in Windows file names anyway, so no legal media
+        # key is lost here. NUL is checked HERE too, not only upstream in
+        # validate_scene: this resolver is a standalone gate, and a NUL
+        # that survives it reaches open() as ValueError, which is not an
+        # OSError and would escape the containment handlers below.
+        raise SceneRenderError(
+            "media_refused",
+            f"source is not a media-root key: {source!r}",
+            field="background.source",
+        )
+    try:
+        root = os.path.realpath(os.path.abspath(os.fspath(media_root)))
+        candidate = os.path.realpath(os.path.join(root, source))
+    except (OSError, ValueError) as exc:
+        # Fail CLOSED: an unresolvable path is refused, never guessed.
+        raise SceneRenderError(
+            "media_refused",
+            f"source cannot be resolved inside the media root: {source!r}",
+            field="background.source",
+        ) from exc
+    # normcase: Windows paths are case-insensitive, a prefix check is not.
+    root_case = os.path.normcase(root)
+    candidate_case = os.path.normcase(candidate)
+    prefix = root_case if root_case.endswith(os.sep) else root_case + os.sep
+    if candidate_case != root_case and not candidate_case.startswith(prefix):
+        raise SceneRenderError(
+            "media_refused",
+            f"source resolves outside the media root: {source!r}",
+            field="background.source",
+        )
+    return candidate
+
+
+def _load_media_bytes(source: str, media_root: Any) -> bytes:
+    """Inline data: URL bytes, or a contained read from the media root."""
+    if source[:5].lower() == "data:":
+        return _decode_data_url(source)
+    path = _resolve_media_source(source, media_root)
+    if not os.path.isfile(path):
+        raise SceneRenderError(
+            "media_missing",
+            f"media key not found in the media root: {source!r}",
+            field="background.source",
+        )
+    try:
+        with open(path, "rb") as handle:
+            return handle.read()
+    except OSError as exc:
+        raise SceneRenderError(
+            "media_unreadable",
+            f"media key could not be read: {source!r}",
+            field="background.source",
+        ) from exc
+
+
+def _open_rgba(payload: bytes, source: str):
+    """Decode bytes to RGBA, wrapping every decode failure as typed."""
+    try:
+        with Image.open(io.BytesIO(payload)) as handle:
+            handle.load()  # force the decode while the buffer is alive
+            return handle.convert("RGBA")
+    except (OSError, ValueError, SyntaxError, Image.DecompressionBombError) as exc:
+        # UnidentifiedImageError is an OSError; DecompressionBombError is
+        # not -- both are media problems, so neither may leak raw.
+        raise SceneRenderError(
+            "media_unreadable",
+            f"media bytes are not a decodable image: {source!r} ({exc})",
+            field="background.source",
+        ) from exc
+
+
+def _render_image_background(canvas, bg: Dict[str, Any], media_root: Any) -> None:
+    w, h = canvas.size
+    payload = _load_media_bytes(bg["source"], media_root)
+    image = _open_rgba(payload, bg["source"])
+    iw, ih = image.size
+    # fit/fill is the viewport mode (letterbox vs cover-crop), then the
+    # user's scale multiplies that base factor.
+    if bg["fit"] == "fit":
+        factor = min(w / iw, h / ih)
+    else:
+        factor = max(w / iw, h / ih)
+    factor *= bg["scale"]
+    tw = max(1, round(iw * factor))
+    th = max(1, round(ih * factor))
+    longest = max(tw, th)
+    if longest > SCENE_MAX_IMAGE_DIM:
+        shrink = SCENE_MAX_IMAGE_DIM / longest
+        tw = max(1, round(tw * shrink))
+        th = max(1, round(th * shrink))
+    if bg["flipH"]:
+        image = image.transpose(Image.FLIP_LEFT_RIGHT)
+    if (tw, th) != (iw, ih):
+        image = image.resize((tw, th), Image.LANCZOS)
+    # TRANSFORM ORDER (rendering contract, not trivia): point-space
+    # M = T . R . S with flip innermost -- expressed in PIL operations as
+    # flip -> scale -> rotate -> translate(paste). Translation is OUTERMOST,
+    # so panX/panY land in the un-rotated CANVAS frame: panning
+    # horizontally always moves pixels horizontally on screen no matter the
+    # rotation angle, and rotation happens about the image's own center.
+    # (Panning before rotation would rotate the pan vector with the image.)
+    rotation = float(bg["rotation"]) % 360.0
+    if rotation:
+        # Scene rotation is clockwise-positive (CSS convention); PIL's
+        # rotate() is counter-clockwise-positive, hence the negation. The
+        # % 360 normalization makes rotation=360 skip resampling entirely,
+        # so 360 degrees returns the byte-identical original.
+        image = image.rotate(
+            -rotation, resample=Image.BICUBIC, expand=True, fillcolor=(0, 0, 0, 0)
+        )
+    bw, bh = image.size
+    dx = (w - bw) / 2 + bg["panX"] * w
+    dy = (h - bh) / 2 + bg["panY"] * h
+    if not (math.isfinite(dx) and math.isfinite(dy)):
+        return  # an infinite pan is beyond any viewport by definition
+    pos = (round(dx), round(dy))
+    if pos[0] + bw <= 0 or pos[0] >= w or pos[1] + bh <= 0 or pos[1] >= h:
+        return  # fully off-canvas: nothing to draw (also bounds the ints)
+    # Paste (verbatim RGBA copy, no blend): the canvas is empty where the
+    # background lands, and source alpha is preserved so letterbox bars
+    # from fit=fit stay untouched -> transparent.
+    canvas.paste(image, pos)
+
+
+def _draw_text_overlay(canvas, overlay: Dict[str, Any], index: int) -> None:
+    w, h = canvas.size
+    text = overlay["text"]
+    if not text:
+        return
+    if len(text) > SCENE_MAX_TEXT_CHARS:
+        raise SceneRenderError(
+            "text_too_long",
+            f"overlays[{index}].text exceeds {SCENE_MAX_TEXT_CHARS} characters",
+            field=f"overlays[{index}].text",
+        )
+    # `size` is a fraction of canvas HEIGHT used as the font height.
+    # Pillow's bundled default font scales to that pixel size with no file
+    # on disk -- this renderer never reaches outside the repo for a font
+    # (the legacy load_font() chain probes C:\Windows\Fonts and is
+    # deliberately NOT used here).
+    font_px = max(1, round(overlay["size"] * h))
+    font = ImageFont.load_default(size=font_px)
+    x0, y0, x1, y1 = font.getbbox(text)
+    tw, th = x1 - x0, y1 - y0
+    if tw > SCENE_MAX_LAYER_DIM or th > SCENE_MAX_LAYER_DIM:
+        raise SceneRenderError(
+            "text_too_long",
+            f"overlays[{index}].text bounds exceed {SCENE_MAX_LAYER_DIM}px",
+            field=f"overlays[{index}].text",
+        )
+    pad = _TEXT_LAYER_PAD
+    layer = Image.new("RGBA", (tw + 2 * pad, th + 2 * pad), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(layer)
+    # Center anchor: shift by the bbox origin so the ink box (not the pen
+    # origin) centers on the layer, which is then centered on (x, y).
+    draw.text(
+        (pad - x0, pad - y0),
+        text,
+        font=font,
+        fill=_hex_rgb(overlay["color"]) + (255,),
+    )
+    rotation = float(overlay["rotation"]) % 360.0
+    if rotation:
+        # Same clockwise-positive convention as the background transform.
+        layer = layer.rotate(
+            -rotation, resample=Image.BICUBIC, expand=True, fillcolor=(0, 0, 0, 0)
+        )
+    lw, lh = layer.size
+    pos = (round(overlay["x"] * w - lw / 2), round(overlay["y"] * h - lh / 2))
+    plate = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    plate.paste(layer, pos)  # clipped silently if it hangs off the canvas
+    # Alpha-composite, not paste: antialiased glyph edges carry partial
+    # alpha that must BLEND with whatever is beneath the overlay.
+    canvas.paste(Image.alpha_composite(canvas, plate))
+
+
+def render_scene(scene, *, media_root, size=(480, 854)):
+    """Render a scene to an RGBA image -- pure, side-effect free.
+
+    Contract (S1-T4):
+      * Everything is computed in GLASS / PORTRAIT space (480x854 by
+        default). The 90-degree-CW buffer rotation stays in
+        portrait_to_buffer, untouched: this function never sees USB.
+      * Deterministic: same scene in -> byte-identical image out (no
+        clock, no randomness, no dict-order dependence).
+      * `media_root` is the ONLY filesystem door: background.source is
+        either a data: URL (decoded inline) or a key resolved and
+        containment-checked inside media_root (_resolve_media_source).
+      * Background gif/video and gpu-temp overlays validate but are not
+        implemented until S1-T5/S3-T12: they raise
+        SceneRenderError("unsupported_*") so the caller can tell
+        "unsupported" from "invalid" (ProtocolError from validate_scene).
+      * ADDITIVE: not wired into the live frame loop (S1-T7, hardware).
+    """
+    if Image is None:
+        raise RuntimeError("Pillow is required for rendering (pip install Pillow)")
+    if not (
+        isinstance(size, tuple)
+        and len(size) == 2
+        and all(
+            isinstance(v, int) and not isinstance(v, bool) and v > 0 for v in size
+        )
+    ):
+        raise ValueError("size must be a (width, height) tuple of positive ints")
+    # Defense in depth: validation errors are ProtocolError, never
+    # SceneRenderError -- the two families stay disjoint for callers.
+    validated = validate_scene(scene)
+    w, h = size
+    canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    background = validated["background"]
+    kind = background["kind"]
+    if kind == "none":
+        pass  # a transparent canvas IS the background
+    elif kind == "color":
+        canvas.paste(_hex_rgb(background["color"]) + (255,), (0, 0, w, h))
+    elif kind == "image":
+        _render_image_background(canvas, background, media_root)
+    else:
+        # gif/video (and any kind the validator might add later): valid but
+        # not implemented here. Checked BEFORE the source is touched, so an
+        # unsupported kind never leaks a media error.
+        raise SceneRenderError(
+            "unsupported_background",
+            f"background kind {kind!r} is not supported by render_scene yet "
+            "(gif/video: S1-T5 / S3-T12)",
+            field="background.kind",
+        )
+    for index, overlay in enumerate(validated["overlays"]):
+        overlay_kind = overlay["kind"]
+        if overlay_kind == "text":
+            _draw_text_overlay(canvas, overlay, index)
+        else:
+            # gpu-temp needs runtime temperature data this pure renderer is
+            # not given; valid shape, unimplementable here.
+            raise SceneRenderError(
+                "unsupported_overlay",
+                f"overlay kind {overlay_kind!r} is not supported by "
+                "render_scene yet",
+                field=f"overlays[{index}].kind",
+            )
+    return canvas
 
 
 def portrait_to_buffer(portrait, rotation: str):

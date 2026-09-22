@@ -5,7 +5,13 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { errMessage, type LyricvisionBridge } from "@/lib/bridge";
-import { SCENE_MAX_TEXT_CHARS, SCENE_OVERLAYS_CAP, type Scene } from "@/lib/scene";
+import {
+  SCENE_MAX_TEXT_CHARS,
+  SCENE_OVERLAYS_CAP,
+  type Background,
+  type MediaBackgroundKind,
+  type Scene,
+} from "@/lib/scene";
 
 /**
  * Scene editor (S2-T8): WYSIWYG surface whose every committed value is
@@ -18,10 +24,15 @@ import { SCENE_MAX_TEXT_CHARS, SCENE_OVERLAYS_CAP, type Scene } from "@/lib/scen
  * interrupted by round-trips), overlay selection, preview bytes, and status
  * messages never leak into settings.
  *
- * TRANSFORM IS STAGED: the schema only accepts rotation/scale/pan/flip/fit
- * on image/gif/video backgrounds, and media import is not implemented yet —
- * committing them now would fail hardening.validateScene, so they stay
- * local until S2-T8b wires media backgrounds.
+ * MEDIA IMPORT (S2-T8b): Image/GIF buttons ask MAIN to open the file dialog
+ * and embed the picked file as a data: URL — the renderer never sees a file
+ * path, and main's rejection tokens are mapped to actionable copy here.
+ *
+ * TRANSFORM COMMIT RULE: the schema binds rotation/scale/pan/flip/fit to
+ * media backgrounds, so they commit into the scene ONLY while an image/gif
+ * background is active; on none/color they stay staged local drafts with an
+ * explicit hint (committing them there would fail hardening.validateScene).
+ * Staged drafts are carried into the first imported media background.
  */
 
 const PREVIEW_DEBOUNCE_MS = 250;
@@ -68,6 +79,92 @@ function stagedNumber(
   if (!Number.isFinite(parsed)) return null;
   const clamped = Math.min(max, Math.max(min, parsed));
   return { draft: clamped === parsed ? raw : String(clamped), commit: clamped };
+}
+
+/** Parsed draft value, or the schema's default when the draft is incomplete. */
+function stagedValue(
+  raw: string,
+  range: readonly [number, number],
+  fallback: number
+): number {
+  const result = stagedNumber(raw, range[0], range[1]);
+  return result ? result.commit : fallback;
+}
+
+/** Transform fields are schema-bound to these kinds (video stays out of S2-T8b). */
+function isMediaKind(background: Background): background is Extract<Background, { kind: "image" | "gif" }> {
+  return background.kind === "image" || background.kind === "gif";
+}
+
+// Keep in sync with the mediaImportError tokens in src/main.js (main process).
+const MEDIA_IMPORT_REASONS = [
+  "media_kind_unsupported",
+  "media_type_unsupported",
+  "media_file_too_large",
+  "media_gif_dimensions_exceeded",
+  "media_gif_frames_exceeded",
+  "media_unreadable",
+] as const;
+type MediaImportReason = (typeof MEDIA_IMPORT_REASONS)[number];
+
+/**
+ * Electron wraps main-process rejections
+ * ("Error invoking remote method 'media:import': Error: media_file_too_large: …"),
+ * so the token is SEARCHED anywhere in the message (same technique as
+ * splitPreviewError). Details from main contain sizes/limits only — main
+ * guarantees no file path ever rides along.
+ */
+function splitMediaImportError(error: unknown): {
+  reason: MediaImportReason | null;
+  detail: string;
+} {
+  const raw = error instanceof Error ? error.message : String(error);
+  for (const candidate of MEDIA_IMPORT_REASONS) {
+    const index = raw.indexOf(candidate);
+    if (index !== -1) {
+      return {
+        reason: candidate,
+        detail: raw.slice(index + candidate.length).replace(/^:\s*/, ""),
+      };
+    }
+  }
+  return { reason: null, detail: "" };
+}
+
+/** Reason token -> copy that always states the next step. */
+function mapMediaImportError(error: unknown, kind: MediaBackgroundKind): string {
+  const { reason, detail } = splitMediaImportError(error);
+  switch (reason) {
+    case "media_kind_unsupported":
+      return "This background type cannot be imported. Pick an image or GIF file.";
+    case "media_type_unsupported":
+      return kind === "gif"
+        ? "This file is not a GIF. Pick a GIF file and try again."
+        : "This file is not a PNG, JPEG, or GIF. Pick a supported file and try again.";
+    case "media_file_too_large":
+      return `This file is too large to embed (${detail}). Pick a smaller file.`;
+    case "media_gif_dimensions_exceeded":
+      return `This GIF exceeds the panel size limit (${detail}). Pick a smaller GIF.`;
+    case "media_gif_frames_exceeded":
+      return `This GIF has too many frames (${detail}). Pick a shorter animation.`;
+    case "media_unreadable":
+      return `This file could not be imported (${detail}). Pick another file and try again.`;
+    default:
+      return "The import could not finish. Close other dialogs and try again.";
+  }
+}
+
+/**
+ * In-use summary derived ONLY from the data: URL (the renderer never sees
+ * a picked filename/path — a non-embedded legacy source must not leak one).
+ * Size is base64-derived and rounded, hence "about N KB".
+ */
+function describeMediaSource(source: string): string {
+  const match = /^data:image\/(png|jpeg|gif);base64,(.*)$/.exec(source);
+  if (!match) return "media file"; // path-style source: label only, never echo it
+  const label = match[1] === "jpeg" ? "JPEG" : match[1].toUpperCase();
+  const bytes = Math.ceil((match[2].length * 3) / 4);
+  return `${label}, about ${Math.max(1, Math.round(bytes / 1024))} KB`;
 }
 
 // Keep in sync with PREVIEW_REASON in src/preview-correlator.js (main process).
@@ -183,6 +280,7 @@ export default function SceneEditor({
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [savedNote, setSavedNote] = useState<string | null>(null);
+  const [importError, setImportError] = useState<string | null>(null);
 
   // Refs, not state: debounce timers and stale-reply guards must not trigger
   // re-renders or capture stale closures.
@@ -195,6 +293,7 @@ export default function SceneEditor({
   const backgroundKind = scene.background.kind;
   const backgroundColor =
     scene.background.kind === "color" ? scene.background.color : COLOR_FALLBACK;
+  const mediaBackground = isMediaKind(scene.background) ? scene.background : null;
   const atCap = overlays.length >= SCENE_OVERLAYS_CAP;
 
   // Keep drafts aligned with the selected overlay whenever the scene or the
@@ -207,6 +306,24 @@ export default function SceneEditor({
         : EMPTY_UNIT_DRAFTS
     );
   }, [scene, safeIndex]);
+
+  // Media backgrounds own the transform values: mirror them back into the
+  // drafts whenever scene state changes (Reset, external load, own commits),
+  // so the inputs never drift from what the panel renders. On none/color the
+  // drafts are intentionally NOT touched — they stay staged for the next
+  // imported media background (import carries them forward).
+  useEffect(() => {
+    const bg = scene.background;
+    if (!isMediaKind(bg)) return;
+    setTransform({
+      rotation: String(bg.rotation),
+      scale: String(bg.scale),
+      panX: String(bg.panX),
+      panY: String(bg.panY),
+    });
+    setFlipH(bg.flipH);
+    setFit(bg.fit);
+  }, [scene]);
 
   const schedulePreview = useCallback((next: Scene) => {
     if (previewTimer.current) clearTimeout(previewTimer.current);
@@ -284,8 +401,33 @@ export default function SceneEditor({
   const handleTransform = (field: TransformField, raw: string) => {
     const [min, max] = TRANSFORM_RANGES[field];
     const result = stagedNumber(raw, min, max);
-    // Staged only: deliberately never committed (see file header).
     setTransformDraft(field, result ? result.draft : raw);
+    // Commit ONLY into an image/gif background: the schema binds transform
+    // keys to media kinds, so on none/color the value stays staged (with
+    // the hint below the section) instead of failing validateScene.
+    const current = scene.background;
+    if (!result || !isMediaKind(current)) return;
+    onSceneChange({
+      ...scene,
+      background: { ...current, [field]: result.commit },
+    });
+    setSavedNote(null);
+  };
+
+  const commitFlip = (next: boolean) => {
+    setFlipH(next);
+    const current = scene.background;
+    if (!isMediaKind(current)) return;
+    onSceneChange({ ...scene, background: { ...current, flipH: next } });
+    setSavedNote(null);
+  };
+
+  const commitFit = (next: "fit" | "fill") => {
+    setFit(next);
+    const current = scene.background;
+    if (!isMediaKind(current)) return;
+    onSceneChange({ ...scene, background: { ...current, fit: next } });
+    setSavedNote(null);
   };
 
   const handleText = (raw: string) => {
@@ -319,6 +461,53 @@ export default function SceneEditor({
           : { kind: "none" },
     });
     setSavedNote(null);
+    setImportError(null);
+  };
+
+  /**
+   * Ask MAIN for a picked file (S2-T8b). The dialog, read, magic sniff and
+   * caps all run in main; this only receives the embedded data: URL.
+   * null = cancelled dialog = deliberate no-op. Failures map to copy that
+   * states the next step and NEVER echo a path (main sends none).
+   */
+  const importBackground = async (kind: MediaBackgroundKind) => {
+    const bridge = window.lyricvision;
+    if (!bridge) {
+      setImportError(
+        "Renderer bridge missing (preload failed). Reopen the window to import media."
+      );
+      return;
+    }
+    setImportError(null);
+    let source: string | null;
+    try {
+      source = await bridge.importMedia(kind);
+    } catch (err) {
+      setImportError(mapMediaImportError(err, kind));
+      return;
+    }
+    if (source === null) return; // cancelled: no-op
+    // Staged drafts are CARRIED into the first imported media background.
+    const next: Background = {
+      kind,
+      source,
+      rotation: stagedValue(transform.rotation, TRANSFORM_RANGES.rotation, 0),
+      flipH,
+      scale: stagedValue(transform.scale, TRANSFORM_RANGES.scale, 1),
+      panX: stagedValue(transform.panX, TRANSFORM_RANGES.panX, 0),
+      panY: stagedValue(transform.panY, TRANSFORM_RANGES.panY, 0),
+      fit,
+    };
+    onSceneChange({ ...scene, background: next });
+    setSavedNote(null);
+  };
+
+  const clearBackground = () => {
+    // Dropping media returns to none; the staged drafts stay local so a
+    // re-import carries them forward again.
+    onSceneChange({ ...scene, background: { kind: "none" } });
+    setSavedNote(null);
+    setImportError(null);
   };
 
   const addOverlay = () => {
@@ -374,11 +563,13 @@ export default function SceneEditor({
     setFit("fit");
     setSaveError(null);
     setSavedNote(null);
+    setImportError(null);
   };
 
   return (
     <div className="space-y-4">
-      {/* Background: NONE and COLOR only — media kinds arrive with import (S2-T8b). */}
+      {/* Background: none/color + media import (S2-T8b). Video (S3) and
+          gpu-temp (S4) stay out until their own tasks. */}
       <div className="space-y-2">
         <p className="text-sm font-medium">Background</p>
         <div className="flex gap-2">
@@ -400,6 +591,24 @@ export default function SceneEditor({
           >
             Color
           </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant={backgroundKind === "image" ? "default" : "outline"}
+            aria-pressed={backgroundKind === "image"}
+            onClick={() => void importBackground("image")}
+          >
+            Image
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant={backgroundKind === "gif" ? "default" : "outline"}
+            aria-pressed={backgroundKind === "gif"}
+            onClick={() => void importBackground("gif")}
+          >
+            GIF
+          </Button>
         </div>
         {scene.background.kind === "color" && (
           <div className="space-y-1">
@@ -417,9 +626,32 @@ export default function SceneEditor({
             />
           </div>
         )}
+        {mediaBackground && (
+          <div className="flex flex-wrap items-center gap-2">
+            {/* Derived from the data: URL only — a picked path never exists here. */}
+            <p className="text-xs text-muted-foreground">{`In use: ${describeMediaSource(mediaBackground.source)}`}</p>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={() => void importBackground(mediaBackground.kind)}
+            >
+              Replace
+            </Button>
+            <Button type="button" size="sm" variant="outline" onClick={clearBackground}>
+              Clear
+            </Button>
+          </div>
+        )}
+        {importError && (
+          <p role="alert" className="text-sm text-destructive">
+            {importError}
+          </p>
+        )}
       </div>
 
-      {/* Transform: staged locally, never committed (see file header). */}
+      {/* Transform: commits into image/gif backgrounds; on none/color the
+          values stay staged with an explicit hint (see file header). */}
       <div className="space-y-2">
         <p className="text-sm font-medium">Transform</p>
         <div className="grid grid-cols-2 gap-3">
@@ -465,7 +697,7 @@ export default function SceneEditor({
             <Checkbox
               id="scene-flip-h"
               checked={flipH}
-              onCheckedChange={(v) => setFlipH(v === true)}
+              onCheckedChange={(v) => commitFlip(v === true)}
             />
             Flip horizontally
           </Label>
@@ -475,7 +707,7 @@ export default function SceneEditor({
               size="sm"
               variant={fit === "fit" ? "default" : "outline"}
               aria-pressed={fit === "fit"}
-              onClick={() => setFit("fit")}
+              onClick={() => commitFit("fit")}
             >
               Fit
             </Button>
@@ -484,16 +716,17 @@ export default function SceneEditor({
               size="sm"
               variant={fit === "fill" ? "default" : "outline"}
               aria-pressed={fit === "fill"}
-              onClick={() => setFit("fill")}
+              onClick={() => commitFit("fill")}
             >
               Fill
             </Button>
           </div>
         </div>
-        <p className="text-xs text-muted-foreground">
-          Used by image backgrounds. Media import is not available yet, so these
-          values stay staged until an image background exists.
-        </p>
+        {!mediaBackground && (
+          <p className="text-xs text-muted-foreground">
+            Pick an image or GIF background to commit these values.
+          </p>
+        )}
       </div>
 
       {/* Text overlays: rows select, one inspector edits the selection. */}

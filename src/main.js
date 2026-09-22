@@ -18,7 +18,7 @@
  *  - renderer loads with meta CSP + setWindowOpenHandler(deny)
  */
 
-const { app, BrowserWindow, ipcMain, Tray, Menu, shell, safeStorage } = require('electron');
+const { app, dialog, BrowserWindow, ipcMain, Tray, Menu, shell, safeStorage } = require('electron');
 const http = require('http');
 const crypto = require('crypto');
 const fs = require('fs');
@@ -1490,6 +1490,289 @@ function pushAuthResult(result) {
   mainWindow.webContents.send('spotify-auth', result);
 }
 
+// ---------------------------------------------------------------------------
+// Media import (S2-T8b): user-picked PNG/JPEG/GIF -> embedded data: URL
+// ---------------------------------------------------------------------------
+//
+// WHY data: URL (not a media/ copy): the scene must be self-contained for
+// settings.json, diagnostics export and the sidecar wire format — a picked
+// file is READ ONCE here, validated, and embedded; the renderer and the
+// settings file never see the picked path (path privacy is a hard rule).
+//
+// Caps: the JS copies below are pinned to the Python sidecar constants by
+// tests/unit/media-import.test.js (cross-language pin) — if either copy
+// drifts, that suite fails. Order mirrors the sidecar's _open_gif:
+// bytes -> format -> dim -> frames. The sidecar re-enforces the same caps
+// at render time (defence in depth): main bounds what ENTERS scene state,
+// the engine bounds what gets DECODED.
+//
+// The sidecar has no byte cap on still-image paths (_render_image_background
+// calls _load_media_bytes without max_bytes), so main applies the 16 MB
+// GIF budget to ALL media: it bounds settings.json/diagnostics payload size
+// and keeps one honest number instead of a media-kind-dependent surprise.
+
+const SCENE_MEDIA_MAX_BYTES = 16 * 1024 * 1024;
+const SCENE_MEDIA_MAX_GIF_DIM = 4096;
+const SCENE_MEDIA_MAX_GIF_FRAMES = 512;
+
+const MEDIA_CAPS = {
+  maxBytes: SCENE_MEDIA_MAX_BYTES,
+  maxGifDim: SCENE_MEDIA_MAX_GIF_DIM,
+  maxGifFrames: SCENE_MEDIA_MAX_GIF_FRAMES,
+};
+
+const MEDIA_MIME = { png: 'image/png', jpeg: 'image/jpeg', gif: 'image/gif' };
+
+/**
+ * Import rejection: `token: detail`, NEVER a file path (every message can
+ * reach renderer/logs/diagnostics). detail carries only sizes/limits.
+ */
+function mediaImportError(token, detail) {
+  return new Error(`${token}: ${detail}`);
+}
+
+function megabytesLabel(capBytes) {
+  return `${Math.floor(capBytes / (1024 * 1024))} MB`;
+}
+
+/**
+ * Magic-byte sniff (never the extension: a .png full of text is rejected,
+ * a real GIF with any name is accepted). Returns the format or null.
+ */
+function sniffMediaFormat(buf) {
+  if (
+    buf.length >= 8 &&
+    buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47 &&
+    buf[4] === 0x0d && buf[5] === 0x0a && buf[6] === 0x1a && buf[7] === 0x0a
+  ) {
+    return 'png';
+  }
+  if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) {
+    return 'jpeg';
+  }
+  if (buf.length >= 6) {
+    const head = buf.toString('ascii', 0, 6);
+    if (head === 'GIF87a' || head === 'GIF89a') return 'gif';
+  }
+  return null;
+}
+
+// Full magics the sniff tests. Boundary (S2-T8d): magic comparison is
+// decisive at the FIRST mismatched byte, at any file length — so the only
+// ambiguous case is a file SHORTER than a magic that matches every byte it
+// has. That file ends inside its own signature: damaged/incomplete
+// (media_unreadable), never "unsupported type". An empty file carries zero
+// magic evidence, matches nothing even partially, and keeps the existing
+// decisive non-match contract (media_type_unsupported).
+const MEDIA_MAGIC_PREFIXES = [
+  [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], // PNG (8)
+  [0xff, 0xd8, 0xff], // JPEG (3)
+  [0x47, 0x49, 0x46, 0x38, 0x37, 0x61], // GIF87a (6)
+  [0x47, 0x49, 0x46, 0x38, 0x39, 0x61], // GIF89a (6)
+];
+
+/** True when the buffer ENDS INSIDE a known magic (truncated header). */
+function isTruncatedMagic(buf) {
+  if (buf.length === 0) return false;
+  // Compare ONLY the bytes the file actually has: .every walks the FULL
+  // magic array, and past buf.length the buffer reads undefined — testing
+  // those entries would make every partial match fail, which is the exact
+  // case this gate exists for.
+  return MEDIA_MAGIC_PREFIXES.some(
+    (magic) =>
+      buf.length < magic.length &&
+      magic.slice(0, buf.length).every((byte, i) => buf[i] === byte)
+  );
+}
+
+/**
+ * Skip a chain of GIF data sub-blocks starting at `pos` (must point at a
+ * length byte). Returns the position after the 0-length terminator; a
+ * chain that would run past the buffer is truncation -> media_unreadable.
+ */
+function gifSkipSubBlocks(buf, pos) {
+  while (pos < buf.length) {
+    const size = buf[pos];
+    pos += 1;
+    if (size === 0) return pos;
+    if (pos + size > buf.length) {
+      throw mediaImportError('media_unreadable', 'the GIF data ends unexpectedly');
+    }
+    pos += size;
+  }
+  throw mediaImportError('media_unreadable', 'the GIF data ends unexpectedly');
+}
+
+/**
+ * Header-only GIF walk (no pixel decode — that is the sidecar's job at
+ * render time): logical-screen dimensions from the LSD, then a block walk
+ * counting image descriptors with an early exit past the frame cap.
+ * Order (bytes already checked, format already sniffed): dim -> frames,
+ * matching _open_gif in bridge/lcd_bridge.py. Tolerates 0x00 padding like
+ * Pillow; any structural truncation is media_unreadable.
+ */
+function gifStructuralCheck(buf, caps) {
+  if (buf.length < 13) {
+    throw mediaImportError('media_unreadable', 'the GIF header is incomplete');
+  }
+  const width = buf.readUInt16LE(6);
+  const height = buf.readUInt16LE(8);
+  if (width > caps.maxGifDim || height > caps.maxGifDim) {
+    throw mediaImportError(
+      'media_gif_dimensions_exceeded',
+      `${width}x${height} pixels, the limit is ${caps.maxGifDim} px per side`
+    );
+  }
+  let pos = 13;
+  // Logical screen descriptor packed byte: a global color table (present in
+  // virtually every real GIF, absent in the synthetic fixtures) sits between
+  // the LSD and the first block — skipping only the LSD would land inside
+  // palette bytes and misread them as blocks.
+  const lsdPacked = buf[10];
+  if (lsdPacked & 0x80) {
+    pos += 3 * (2 ** ((lsdPacked & 0x07) + 1));
+    if (pos > buf.length) {
+      throw mediaImportError('media_unreadable', 'the GIF data ends unexpectedly');
+    }
+  }
+  let frames = 0;
+  for (;;) {
+    if (pos >= buf.length) {
+      throw mediaImportError('media_unreadable', 'the GIF data ends unexpectedly');
+    }
+    const block = buf[pos];
+    if (block === 0x3b) return { width, height, frames }; // trailer
+    if (block === 0x00) {
+      pos += 1; // tolerate stray padding bytes (Pillow does the same)
+      continue;
+    }
+    if (block === 0x21) {
+      pos = gifSkipSubBlocks(buf, pos + 2); // extension intro + label
+      continue;
+    }
+    if (block === 0x2c) {
+      if (pos + 10 > buf.length) {
+        throw mediaImportError('media_unreadable', 'the GIF data ends unexpectedly');
+      }
+      frames += 1;
+      if (frames > caps.maxGifFrames) {
+        // Early exit: a malicious 100k-frame GIF stops costing us here.
+        throw mediaImportError(
+          'media_gif_frames_exceeded',
+          `${frames} frames, the limit is ${caps.maxGifFrames} frames`
+        );
+      }
+      const packed = buf[pos + 9];
+      pos += 10;
+      if (packed & 0x80) pos += 3 * (2 ** ((packed & 0x07) + 1)); // local color table
+      if (pos >= buf.length) {
+        throw mediaImportError('media_unreadable', 'the GIF data ends unexpectedly');
+      }
+      pos += 1; // LZW minimum code size
+      pos = gifSkipSubBlocks(buf, pos);
+      continue;
+    }
+    throw mediaImportError('media_unreadable', 'unexpected block in the GIF structure');
+  }
+}
+
+/**
+ * Read one picked file and embed it as a data: URL (test seam — the caps
+ * argument exists so boundary logic is testable without 16 MB fixtures,
+ * while the real-cap tests below still pin the shipped numbers).
+ *
+ * Check order (sidecar mirror): kind -> bytes (stat BEFORE read, then a
+ * post-read re-check against the TOCTOU window) -> format (magic) ->
+ * GIF dim -> GIF frames. Every rejection carries NO path.
+ * @param {string} filePath - absolute path from the dialog (never echoed).
+ * @param {'image'|'gif'} kind - dialog intent: gif is GIF-only, image is
+ *   PNG/JPEG/GIF (Pillow's Image.open accepts all three; oversized stills
+ *   are SHRUNK by the sidecar, not rejected, so main does not invent a
+ *   refusal the render path does not have).
+ * @param {{maxBytes:number,maxGifDim:number,maxGifFrames:number}} [caps]
+ * @returns {Promise<string>} data:<mime>;base64,<payload>
+ */
+async function importMediaFromPath(filePath, kind, caps = MEDIA_CAPS) {
+  if (kind !== 'image' && kind !== 'gif') {
+    throw mediaImportError('media_kind_unsupported', 'kind must be "image" or "gif"');
+  }
+  let size;
+  try {
+    size = (await fs.promises.stat(filePath)).size;
+  } catch {
+    throw mediaImportError('media_unreadable', 'the file could not be opened');
+  }
+  if (size > caps.maxBytes) {
+    // stat-first: a huge file is refused without ever being read.
+    throw mediaImportError(
+      'media_file_too_large',
+      `${size} bytes, the limit is ${megabytesLabel(caps.maxBytes)}`
+    );
+  }
+  let buf;
+  try {
+    buf = await fs.promises.readFile(filePath);
+  } catch {
+    throw mediaImportError('media_unreadable', 'the file could not be read');
+  }
+  if (buf.length > caps.maxBytes) {
+    // TOCTOU belt: the file grew between stat and read.
+    throw mediaImportError(
+      'media_file_too_large',
+      `${buf.length} bytes, the limit is ${megabytesLabel(caps.maxBytes)}`
+    );
+  }
+  const format = sniffMediaFormat(buf);
+  if (!format && isTruncatedMagic(buf)) {
+    // Shorter than the signature it matches byte-for-byte: the file is cut
+    // short, so claiming "unsupported type" would be a false statement about
+    // a perfectly supported format.
+    throw mediaImportError(
+      'media_unreadable',
+      'the file ends inside its type signature — it looks truncated or incomplete'
+    );
+  }
+  if (!format || (kind === 'gif' && format !== 'gif')) {
+    throw mediaImportError(
+      'media_type_unsupported',
+      kind === 'gif' ? 'expected GIF data' : 'expected PNG, JPEG, or GIF data'
+    );
+  }
+  if (kind === 'gif') gifStructuralCheck(buf, caps); // dim -> frames
+  return `data:${MEDIA_MIME[format]};base64,${buf.toString('base64')}`;
+}
+
+/**
+ * Dialog flow for `media:import`: validate the kind BEFORE the dialog
+ * opens, cancelled/no-file results resolve null (a deliberate no-op the
+ * renderer must not treat as an error), and only main's dialog module and
+ * window are injectable for tests.
+ */
+async function handleMediaImport(kind, dialogModule, parentWindow) {
+  if (kind !== 'image' && kind !== 'gif') {
+    throw mediaImportError('media_kind_unsupported', 'kind must be "image" or "gif"');
+  }
+  const options = {
+    properties: ['openFile'],
+    filters:
+      kind === 'gif'
+        ? [{ name: 'GIF images', extensions: ['gif'] }]
+        : [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif'] }],
+  };
+  const result = parentWindow
+    ? await dialogModule.showOpenDialog(parentWindow, options)
+    : await dialogModule.showOpenDialog(options);
+  if (
+    !result ||
+    result.canceled === true ||
+    !Array.isArray(result.filePaths) ||
+    result.filePaths.length === 0
+  ) {
+    return null;
+  }
+  return importMediaFromPath(result.filePaths[0], kind, MEDIA_CAPS);
+}
+
 function registerIpc() {
   ipcMain.handle('settings:get', () => ({
     settings: loadSettings(),
@@ -1525,6 +1808,17 @@ function registerIpc() {
   // S2-T8: the live preview rides the SAME sidecar; handlePreviewRequest
   // re-validates the scene before a byte reaches the pipe.
   ipcMain.handle('scene:preview', (_event, scene) => handlePreviewRequest(scene, bridgeChild));
+
+  // S2-T8b: media import runs ENTIRELY in main (dialog + read + validate);
+  // only an embedded data: URL ever crosses back to the renderer, so the
+  // picked path never reaches renderer state, settings or diagnostics.
+  ipcMain.handle('media:import', (_event, kind) => {
+    const parentWindow =
+      typeof BrowserWindow.getFocusedWindow === 'function'
+        ? BrowserWindow.getFocusedWindow()
+        : null;
+    return handleMediaImport(kind, dialog, parentWindow);
+  });
 
   ipcMain.handle('spotify:connect', async (_event, args) => {
     const clientId = args && typeof args.clientId === 'string' ? args.clientId.trim() : '';
@@ -1661,6 +1955,16 @@ module.exports = {
   bridgeStatusLine,
   handleBridgeLine,
   handlePreviewRequest,
+  // S2-T8b media import seams (dialog/read/validation are testable without
+  // hardware; cap constants are pinned to the Python sidecar by
+  // tests/unit/media-import.test.js).
+  registerIpc,
+  handleMediaImport,
+  importMediaFromPath,
+  MEDIA_CAPS,
+  SCENE_MEDIA_MAX_BYTES,
+  SCENE_MEDIA_MAX_GIF_DIM,
+  SCENE_MEDIA_MAX_GIF_FRAMES,
   getLcdStatus,
   buildDiagnosticsPayload,
   diagnosticsFilePath,

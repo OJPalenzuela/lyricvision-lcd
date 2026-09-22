@@ -7,13 +7,20 @@ import userEvent from "@testing-library/user-event";
 import App from "@/App";
 import SceneEditor from "@/components/SceneEditor";
 import type { LyricvisionBridge, StoredSettings } from "@/lib/bridge";
-import { DEFAULT_SCENE, SCENE_OVERLAYS_CAP, type Scene } from "@/lib/scene";
+import { DEFAULT_SCENE, SCENE_OVERLAYS_CAP, type MediaBackgroundKind, type Scene } from "@/lib/scene";
 
 const requireNative = createRequire(import.meta.url);
 interface HardeningGate {
   validateScene(input: unknown): { ok: boolean; field?: string; error?: string };
 }
 const hardening = requireNative("../../src/hardening.js") as HardeningGate;
+
+// Pillow-verified fixtures (1x1 PNG / 8x8 3-frame GIF), same as
+// tests/unit/media-import.test.js: real bytes, not placeholder strings.
+const PNG_DATA_URL =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGPgEpEDAABoAD1UCKP3AAAAAElFTkSuQmCC";
+const GIF_DATA_URL =
+  "data:image/gif;base64,R0lGODlhCAAIAIEAAP8AAAAAAAAAAAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQACgAAACwAAAAACAAIAAAIDwABCBxIsKDBgwgTKkwYEAAh+QQBCgABACwAAAAACAAIAIEA/wAAAAAAAAAAAAAIDwABCBxIsKDBgwgTKkwYEAAh+QQBCgABACwAAAAACAAIAIEAAP8AAAAAAAAAAAAIDwABCBxIsKDBgwgTKkwYEAA7";
 
 const DEFAULT_SETTINGS: StoredSettings = {
   spotifyClientId: "",
@@ -27,6 +34,7 @@ const DEFAULT_SETTINGS: StoredSettings = {
 
 interface StubBridge extends LyricvisionBridge {
   previewScene: Mock<(scene: Scene) => Promise<string>>;
+  importMedia: Mock<(kind: MediaBackgroundKind) => Promise<string | null>>;
 }
 
 function makeBridge(): StubBridge {
@@ -48,6 +56,8 @@ function makeBridge(): StubBridge {
     onPlayerState: vi.fn(() => vi.fn()),
     onSpotifyAuth: vi.fn(() => vi.fn()),
     previewScene: vi.fn(async () => "data:image/png;base64,aGVsbG8="),
+    // Default: dialog cancelled (null = no-op). Tests override per scenario.
+    importMedia: vi.fn(async () => null),
   };
 }
 
@@ -101,6 +111,34 @@ function textOverlay(text: string) {
   };
 }
 
+function sceneWithMedia(
+  kind: "image" | "gif",
+  overrides: Partial<{
+    rotation: number;
+    flipH: boolean;
+    scale: number;
+    panX: number;
+    panY: number;
+    fit: "fit" | "fill";
+    source: string;
+  }> = {}
+): Scene {
+  return {
+    ...DEFAULT_SCENE,
+    background: {
+      kind,
+      source: kind === "gif" ? GIF_DATA_URL : PNG_DATA_URL,
+      rotation: 0,
+      flipH: false,
+      scale: 1,
+      panX: 0,
+      panY: 0,
+      fit: "fit",
+      ...overrides,
+    },
+  };
+}
+
 describe('live preview states', () => {
   it('renders the preview <img> fed by the engine data URL', async () => {
     const { bridge } = setup();
@@ -146,20 +184,247 @@ describe('live preview states', () => {
     );
     expect(text.textContent).toContain("Fix the value and try again.");
   });
+
+  it('surfaces an engine-side media rejection (sidecar defence in depth)', async () => {
+    setup(DEFAULT_SCENE, (bridge) => {
+      bridge.previewScene.mockRejectedValue(
+        new Error(
+          "preview_engine_error: media_too_large: media payload is 16777217 bytes, over the 16777216 byte cap"
+        )
+      );
+    });
+    const text = await screen.findByText(
+      /Engine rejected the scene \(media_too_large/,
+      {},
+      { timeout: 3000 }
+    );
+    expect(text.textContent).toContain("Fix the value and try again.");
+  });
 });
 
-describe("background: none and color only in this task", () => {
-  it("never offers image, gif or video", async () => {
+describe("background: media import (S2-T8b)", () => {
+  it("offers Image and GIF, never Video or gpu-temp, and keeps Color working", async () => {
     const { onChange, user } = setup();
-    expect(screen.queryByRole("button", { name: "Image" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "GIF" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Image" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "GIF" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Video" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/gpu-temp/i)).not.toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Color" }));
     expect(screen.getByLabelText("Background color")).toBeInTheDocument();
     expect(lastScene(onChange).background).toEqual({
       kind: "color",
       color: expect.any(String),
+    });
+  });
+
+  it("imports a PNG into an image background and shows the in-use summary", async () => {
+    const { bridge, onChange, user } = setup(undefined, (stub) => {
+      stub.importMedia.mockResolvedValue(PNG_DATA_URL);
+    });
+    await user.click(screen.getByRole("button", { name: "Image" }));
+    await waitFor(() => expect(bridge.importMedia).toHaveBeenCalledWith("image"));
+
+    const background = lastScene(onChange).background;
+    expect(background).toMatchObject({
+      kind: "image",
+      source: PNG_DATA_URL,
+      rotation: 0,
+      flipH: false,
+      scale: 1,
+      panX: 0,
+      panY: 0,
+      fit: "fit",
+    });
+    expect(hardening.validateScene(lastScene(onChange)).ok).toBe(true);
+    expect(await screen.findByText(/In use: PNG, about 1 KB/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Replace" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Clear" })).toBeInTheDocument();
+  });
+
+  it("imports a GIF into a gif background", async () => {
+    const { bridge, onChange, user } = setup(undefined, (stub) => {
+      stub.importMedia.mockResolvedValue(GIF_DATA_URL);
+    });
+    await user.click(screen.getByRole("button", { name: "GIF" }));
+    await waitFor(() => expect(bridge.importMedia).toHaveBeenCalledWith("gif"));
+
+    expect(lastScene(onChange).background).toMatchObject({
+      kind: "gif",
+      source: GIF_DATA_URL,
+    });
+    expect(hardening.validateScene(lastScene(onChange)).ok).toBe(true);
+    expect(await screen.findByText(/In use: GIF, about 1 KB/)).toBeInTheDocument();
+  });
+
+  it("treats a cancelled dialog as a no-op", async () => {
+    const { bridge, onChange, user } = setup(); // stub default resolves null
+    await user.click(screen.getByRole("button", { name: "Image" }));
+    await waitFor(() => expect(bridge.importMedia).toHaveBeenCalledTimes(1));
+    expect(onChange).not.toHaveBeenCalled();
+    expect(screen.queryByText(/In use:/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("shows actionable copy when main rejects the file", async () => {
+    const { onChange, user } = setup(undefined, (stub) => {
+      stub.importMedia.mockRejectedValue(
+        new Error(
+          "Error invoking remote method 'media:import': Error: media_file_too_large: 17825807 bytes, the limit is 16 MB"
+        )
+      );
+    });
+    await user.click(screen.getByRole("button", { name: "GIF" }));
+    const alert = await screen.findByText(/This file is too large to embed/);
+    expect(alert.textContent).toContain("17825807 bytes, the limit is 16 MB");
+    expect(alert.textContent).toContain("Pick a smaller file.");
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it("falls back to actionable copy when the import fails without a reason", async () => {
+    const { user } = setup(undefined, (stub) => {
+      stub.importMedia.mockRejectedValue(new Error("boom"));
+    });
+    await user.click(screen.getByRole("button", { name: "Image" }));
+    const alert = await screen.findByText(/The import could not finish\./);
+    expect(alert.textContent).toContain("try again");
+  });
+
+  // S2-T8d: truncation and unknown-type are DIFFERENT statements — the UI
+  // must map both tokens to their own actionable copy.
+  it("maps media_unreadable to copy that names truncation and the next step", async () => {
+    const { onChange, user } = setup(undefined, (stub) => {
+      stub.importMedia.mockRejectedValue(
+        new Error(
+          "Error invoking remote method 'media:import': Error: media_unreadable: the file ends inside its type signature — it looks truncated or incomplete"
+        )
+      );
+    });
+    await user.click(screen.getByRole("button", { name: "Image" }));
+    const alert = await screen.findByText(/truncated or incomplete/);
+    expect(alert.textContent).toContain("This file could not be imported");
+    expect(alert.textContent).toContain("Pick another file and try again.");
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it("maps media_type_unsupported to copy that names the supported types and the next step", async () => {
+    const { onChange, user } = setup(undefined, (stub) => {
+      stub.importMedia.mockRejectedValue(
+        new Error(
+          "Error invoking remote method 'media:import': Error: media_type_unsupported: expected PNG, JPEG, or GIF data"
+        )
+      );
+    });
+    await user.click(screen.getByRole("button", { name: "Image" }));
+    const alert = await screen.findByText(/not a PNG, JPEG, or GIF/);
+    expect(alert.textContent).toContain("Pick a supported file and try again.");
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it("replaces the media in place and clears back to none", async () => {
+    const { bridge, onChange, user } = setup(undefined, (stub) => {
+      stub.importMedia.mockResolvedValue(PNG_DATA_URL);
+    });
+    await user.click(screen.getByRole("button", { name: "Image" }));
+    await screen.findByText(/In use: PNG/);
+
+    await user.click(screen.getByRole("button", { name: "Replace" }));
+    await waitFor(() => expect(bridge.importMedia).toHaveBeenCalledTimes(2));
+    expect(bridge.importMedia).toHaveBeenLastCalledWith("image"); // kind is kept
+
+    await user.click(screen.getByRole("button", { name: "Clear" }));
+    expect(lastScene(onChange).background).toEqual({ kind: "none" });
+    expect(screen.queryByText(/In use:/)).not.toBeInTheDocument();
+  });
+
+  it("carries staged transform drafts into the first imported media background", async () => {
+    const { onChange, user } = setup(undefined, (stub) => {
+      stub.importMedia.mockResolvedValue(PNG_DATA_URL);
+    });
+    const rotation = screen.getByLabelText(
+      "Rotation (degrees)"
+    ) as HTMLInputElement;
+    fireEvent.change(rotation, { target: { value: "45" } });
+    expect(onChange).not.toHaveBeenCalled(); // staged while the background is none
+
+    await user.click(screen.getByRole("button", { name: "Image" }));
+    expect(lastScene(onChange).background).toMatchObject({
+      kind: "image",
+      rotation: 45,
+    });
+
+    // Drafts survive a Clear and are carried into the next import too.
+    await user.click(screen.getByRole("button", { name: "Clear" }));
+    expect(lastScene(onChange).background).toEqual({ kind: "none" });
+    await user.click(screen.getByRole("button", { name: "Image" }));
+    expect(lastScene(onChange).background).toMatchObject({
+      kind: "image",
+      rotation: 45,
+    });
+  });
+
+  it("syncs the drafts from a scene that already carries media", () => {
+    setup(
+      sceneWithMedia("image", {
+        rotation: 30,
+        scale: 2,
+        panX: 0.25,
+        panY: -0.5,
+        flipH: true,
+        fit: "fill",
+      })
+    );
+    expect(screen.getByLabelText("Rotation (degrees)")).toHaveValue("30");
+    expect(screen.getByLabelText("Scale")).toHaveValue("2");
+    expect(screen.getByLabelText("Pan X (-1 to 1)")).toHaveValue("0.25");
+    expect(screen.getByLabelText("Flip horizontally")).toBeChecked();
+    expect(screen.getByRole("button", { name: "Fill" })).toHaveAttribute(
+      "aria-pressed",
+      "true"
+    );
+    expect(
+      screen.queryByText(/Pick an image or GIF background to commit these values\./)
+    ).not.toBeInTheDocument();
+  });
+
+  it("commits rotation, scale, pan, flip and fit into an image background", async () => {
+    const { onChange, user } = setup(sceneWithMedia("image"));
+
+    const rotation = screen.getByLabelText(
+      "Rotation (degrees)"
+    ) as HTMLInputElement;
+    fireEvent.change(rotation, { target: { value: "90" } });
+    expect(lastScene(onChange).background).toMatchObject({ rotation: 90 });
+
+    const scale = screen.getByLabelText("Scale") as HTMLInputElement;
+    fireEvent.change(scale, { target: { value: "2" } });
+    expect(lastScene(onChange).background).toMatchObject({ scale: 2 });
+
+    const panX = screen.getByLabelText("Pan X (-1 to 1)") as HTMLInputElement;
+    fireEvent.change(panX, { target: { value: "0.5" } });
+    expect(lastScene(onChange).background).toMatchObject({ panX: 0.5 });
+
+    const panY = screen.getByLabelText("Pan Y (-1 to 1)") as HTMLInputElement;
+    fireEvent.change(panY, { target: { value: "-0.25" } });
+    expect(lastScene(onChange).background).toMatchObject({ panY: -0.25 });
+
+    await user.click(screen.getByLabelText("Flip horizontally"));
+    expect(lastScene(onChange).background).toMatchObject({ flipH: true });
+
+    await user.click(screen.getByRole("button", { name: "Fill" }));
+    expect(lastScene(onChange).background).toMatchObject({ kind: "image", fit: "fill" });
+    expect(hardening.validateScene(lastScene(onChange)).ok).toBe(true);
+  });
+
+  it("commits transform values into a gif background too", () => {
+    const { onChange } = setup(sceneWithMedia("gif"));
+    const rotation = screen.getByLabelText(
+      "Rotation (degrees)"
+    ) as HTMLInputElement;
+    fireEvent.change(rotation, { target: { value: "-45" } });
+    expect(lastScene(onChange).background).toMatchObject({
+      kind: "gif",
+      rotation: -45,
     });
   });
 });
@@ -226,18 +491,30 @@ describe("numeric inspector clamping", () => {
     expect(hardening.validateScene(lastScene(onChange)).ok).toBe(true);
   });
 
-  it("keeps transform fields staged locally (the schema binds them to media kinds)", async () => {
+  it("keeps transform fields staged on non-media backgrounds", async () => {
     const { onChange } = setup();
     const rotation = screen.getByLabelText(
       "Rotation (degrees)"
     ) as HTMLInputElement;
     fireEvent.change(rotation, { target: { value: "9999" } });
     expect(rotation.value).toBe("360"); // clamped to the declared UI range
-    // None/color backgrounds carry NO transform keys — wiring them in would
-    // fail validateScene, so staging stays local until media import (S2-T8b).
+    // None/color backgrounds carry NO transform keys — committing them would
+    // fail validateScene, so the values stay staged with an explicit hint.
     expect(onChange).not.toHaveBeenCalled();
     expect(
-      screen.getByText(/Used by image backgrounds\./)
+      screen.getByText(/Pick an image or GIF background to commit these values\./)
+    ).toBeInTheDocument();
+  });
+
+  it("keeps transform fields staged on a color background", async () => {
+    const { onChange, user } = setup();
+    await user.click(screen.getByRole("button", { name: "Color" }));
+    onChange.mockClear();
+    const scale = screen.getByLabelText("Scale") as HTMLInputElement;
+    fireEvent.change(scale, { target: { value: "3" } });
+    expect(onChange).not.toHaveBeenCalled();
+    expect(
+      screen.getByText(/Pick an image or GIF background to commit these values\./)
     ).toBeInTheDocument();
   });
 });
@@ -261,6 +538,21 @@ describe("persisting the scene", () => {
     await user.click(screen.getByRole("button", { name: "Scene editor" }));
     const img = await screen.findByAltText("Scene preview", {}, { timeout: 3000 });
     expect(img).toBeInTheDocument();
+  });
+
+  it("saves a media scene with the embedded source intact", async () => {
+    const { bridge, user } = setup(sceneWithMedia("gif", { rotation: 20 }));
+    await user.click(screen.getByRole("button", { name: "Save scene" }));
+    await waitFor(() => expect(bridge.saveSettings).toHaveBeenCalledTimes(1));
+    const patch = bridge.saveSettings.mock.calls[0][0];
+    expect(patch.scene).toBeDefined();
+    expect(hardening.validateScene(patch.scene).ok).toBe(true);
+    if (!patch.scene) throw new Error("scene missing");
+    expect(patch.scene.background).toMatchObject({
+      kind: "gif",
+      source: GIF_DATA_URL,
+      rotation: 20,
+    });
   });
 
   it("shows the rejected field path when the settings gate refuses the scene", async () => {

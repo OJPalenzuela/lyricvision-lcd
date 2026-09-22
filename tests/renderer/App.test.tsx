@@ -46,6 +46,7 @@ function makeBridge(settings: Partial<StoredSettings> = {}): StubBridge {
     exportDiagnostics: vi.fn(async () => ({ path: 'diag.json' })),
     onPlayerState: vi.fn(() => vi.fn()),
     onSpotifyAuth: vi.fn(() => vi.fn()),
+    importMedia: vi.fn(async () => null),
   };
 }
 

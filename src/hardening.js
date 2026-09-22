@@ -207,6 +207,20 @@ const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
 // straight out of lcd_bridge.py.
 const SCENE_MAX_TEXT_CHARS = 4096;
 
+// S2-T8d: settings:save -> validateScene is the ONLY path by which a scene
+// reaches disk, so the 16 MB media budget must hold HERE too — as a character
+// ceiling on background.source, not only on the media:import read.
+// Arithmetic from the sidecar cap SCENE_MAX_GIF_BYTES = 16 * 1024 * 1024 raw
+// bytes (bridge/lcd_bridge.py): base64 is 4 * ceil(raw / 3) chars
+// (4 * ceil(16777216 / 3) = 22369624) plus the longest accepted prefix
+// "data:image/jpeg;base64," (23 chars) = 22369647.
+// NEVER lower: a legitimately-at-cap import encodes to exactly this many
+// chars and must still save; anything longer encodes more than 16 MB of raw
+// media, which no import path can produce. Pinned to the Python constant by
+// tests/unit/media-import.test.js; both JS copies pinned by
+// tests/renderer/media-source-gate.test.ts.
+const SCENE_MEDIA_SOURCE_MAX_CHARS = 22369647;
+
 function sceneReject(field, error) {
   return { ok: false, field, error };
 }
@@ -309,6 +323,12 @@ function validateSceneBackground(value) {
     case 'video': {
       if (!isSource(value.source)) {
         return sceneReject('background.source', 'source must be a non-empty string without NUL or ".." segments');
+      }
+      if (value.source.length > SCENE_MEDIA_SOURCE_MAX_CHARS) {
+        return sceneReject(
+          'background.source',
+          `source exceeds the ${SCENE_MEDIA_SOURCE_MAX_CHARS} character limit`
+        );
       }
       if (!isFiniteNumber(value.rotation)) return sceneReject('background.rotation', 'rotation must be a finite number');
       if (typeof value.flipH !== 'boolean') return sceneReject('background.flipH', 'flipH must be a boolean');
@@ -442,6 +462,7 @@ module.exports = {
   // key. DEFAULT_SCENE/SCENE_OVERLAYS_CAP mirror src/renderer/lib/scene.ts.
   validateScene,
   SCENE_MAX_TEXT_CHARS,
+  SCENE_MEDIA_SOURCE_MAX_CHARS,
   DEFAULT_SCENE,
   SCENE_OVERLAYS_CAP,
 };

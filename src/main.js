@@ -1525,4 +1525,8 @@ module.exports = {
   currentTrackKey,
   createTray,
   createWindow,
+  startBridge,
+  sendStateToBridge,
+  pollNow,
+  bridgeWatchdog,
 };

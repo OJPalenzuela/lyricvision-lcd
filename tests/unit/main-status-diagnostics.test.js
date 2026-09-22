@@ -425,26 +425,19 @@ describe('handleBridgeLine (WARNING 2 follow-up: the lastBridgeStatus writer)', 
   // here fails (not a function); after, all pass with no production-
   // behavior change (additive export only).
   //
-  // Honest boundary (verified, not assumed): driving the writer stores the
-  // status line and pushes it to the renderer, but computeLcdStatus STILL
-  // returns offline headless — the `!bridgeChild` guard (src/main.js:1076)
-  // fires before any status-driven branch. Of the 6 LcdStatusKind values
-  // only `offline` gets richer (stored line + renderer lcd payload); the
-  // other 5 stay uncovered — but NOT because hardware or network is
-  // required. Each is gated on a module-scoped variable whose writer the
-  // module.exports hook (src/main.js:1486-1528) simply does not expose:
-  // - ok / degraded (queue>=20, :1086) / degraded (exclusivity, :1089) /
-  //   degraded (poll error, :1090) / bridge-wedged (:1078): all sit below
-  //   the !bridgeChild guard; `bridgeChild` is written only by
-  //   startBridge() (:979), which is not exported. Stubbing
-  //   `./bridge-spawn` (:27) plus one additive export reaches them.
-  // - panel-unknown (:1060): needs lastBridgeExit.code === 2 from the
-  //   child 'exit' handler (:1007) — a fake child emitting exit 2, no panel.
-  // - auth-error (:1059): needs authBroken=true from pollNow() (:615,
-  //   :638) — a stubbed token path, no Spotify round-trip.
-  // Closing them is a test-scaffolding follow-up (additive export + module
-  // stubs), never a production logic change; until then the five kinds are
-  // reported as still-open, not faked.
+  // Honest boundary on THIS shared instance: no child is ever started here,
+  // so the `!bridgeChild` guard (src/main.js:1076) fires first and
+  // computeLcdStatus returns offline — exactly what the guard pin below
+  // asserts, and what keeps a branch reorder from silently passing.
+  //
+  // That is a property of this instance, not a coverage limit. All 6
+  // LcdStatusKind values are covered headless by the fresh-instance
+  // describes further down: startBridge + a stubbed `./bridge-spawn` fake
+  // child reaches every branch below the guard, with no USB and no network.
+  // An earlier version of this comment claimed 5 kinds needed a real child,
+  // a real panel or a real Spotify round-trip; that was refuted by reading
+  // the writers — the additive exports at src/main.js:1528-1531
+  // (startBridge, sendStateToBridge, pollNow, bridgeWatchdog) close them.
 
   it('is exposed through the module.exports test hook', () => {
     expect(typeof main.handleBridgeLine).toBe('function');
@@ -531,5 +524,207 @@ describe('handleBridgeLine (WARNING 2 follow-up: the lastBridgeStatus writer)', 
     const status = main.computeLcdStatus();
     expect(status.status).toBe('offline');
     expect(status.reason).toBe('bridge not running');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// computeLcdStatus: all six LcdStatusKind values, headless.
+//
+// Why fresh instances: the gates (bridgeChild, lastBridgeExit, authBroken,
+// lastPollError, exclusivityWarn, watchdog) are module-scoped with no
+// setters by design — resetting them from a test would mean production
+// setters. Instead each test re-requires src/main.js (native Node loader,
+// same Module._load stub style as above) after pointing ./bridge-spawn at a
+// fake child factory. No network, no USB, no shell.openExternal. Every timer
+// the module schedules (pollTimer, watchdog tick, restart backoff) is
+// unref'd in production code, so stale instances cannot hang the run.
+// ---------------------------------------------------------------------------
+const { EventEmitter: BridgeTestEventEmitter } = requireNative('node:events');
+
+// Mutable fake consulted ONLY while a fresh instance loads. Chained onto the
+// existing Module._load patch above without touching its lines.
+let bridgeSpawnStubFn = null;
+const loadBeforeBridgeSpawnStub = Module._load;
+Module._load = function (request, ...rest) {
+  if (typeof request === 'string' && request.endsWith('bridge-spawn') && bridgeSpawnStubFn) {
+    return { spawnBridge: bridgeSpawnStubFn };
+  }
+  return loadBeforeBridgeSpawnStub.call(this, request, ...rest);
+};
+
+// Fake sidecar child: EventEmitter surface startBridge() attaches to
+// (stdout/stderr 'data', 'error'/'exit'), plus stdin/kill/exitCode which
+// sendStateToBridge() and the watchdog onRestart path touch.
+function makeFakeBridgeChild({ writeImpl } = {}) {
+  const child = new BridgeTestEventEmitter();
+  child.stdout = new BridgeTestEventEmitter();
+  child.stderr = new BridgeTestEventEmitter();
+  child.exitCode = null;
+  child.spawnfile = 'fake-bridge';
+  child.spawnargs = [];
+  child.__bridgeSource = 'test-fake';
+  child.killCalls = 0;
+  child.kill = () => {
+    child.killCalls += 1;
+    return true;
+  };
+  child.stdinWrites = [];
+  child.stdin = {
+    write: (line) => {
+      child.stdinWrites.push(line);
+      return writeImpl ? writeImpl(line) : true;
+    },
+    end: () => {},
+  };
+  return child;
+}
+
+function loadFreshMain(spawnImpl) {
+  bridgeSpawnStubFn = spawnImpl;
+  try {
+    const freshPath = requireNative.resolve('../../src/main.js');
+    delete requireNative.cache[freshPath];
+    return requireNative('../../src/main.js');
+  } finally {
+    bridgeSpawnStubFn = null;
+  }
+}
+
+describe('export seams for headless status coverage (RED: missing before the unlock)', () => {
+  it('exposes startBridge (sole bridgeChild writer headless)', () => {
+    const fresh = loadFreshMain(() => makeFakeBridgeChild());
+    expect(typeof fresh.startBridge).toBe('function');
+  });
+
+  it('exposes sendStateToBridge (narrowest lastPollError writer without network)', () => {
+    const fresh = loadFreshMain(() => makeFakeBridgeChild());
+    expect(typeof fresh.sendStateToBridge).toBe('function');
+  });
+
+  it('exposes pollNow (sole authBroken writer)', () => {
+    const fresh = loadFreshMain(() => makeFakeBridgeChild());
+    expect(typeof fresh.pollNow).toBe('function');
+  });
+
+  it('exposes bridgeWatchdog (only deterministic route to isWedged without sleeps)', () => {
+    const fresh = loadFreshMain(() => makeFakeBridgeChild());
+    expect(fresh.bridgeWatchdog).toBeDefined();
+    expect(typeof fresh.bridgeWatchdog.check).toBe('function');
+    expect(typeof fresh.bridgeWatchdog.isWedged).toBe('function');
+  });
+});
+
+describe('computeLcdStatus reaches all six kinds headless (fresh instance per test)', () => {
+  afterEach(() => {
+    execCalls.length = 0;
+    execMode = 'empty';
+  });
+
+  it('reaches ok with a live fake child and no error state', () => {
+    const kids = [];
+    const fresh = loadFreshMain(() => {
+      const c = makeFakeBridgeChild();
+      kids.push(c);
+      return c;
+    });
+    fresh.startBridge();
+    expect(kids).toHaveLength(1);
+    const status = fresh.computeLcdStatus();
+    expect(status.status).toBe('ok');
+    expect(status.reason).toBe('idle');
+  });
+
+  it('reaches degraded when the status queue >= 20', () => {
+    const fresh = loadFreshMain(() => makeFakeBridgeChild());
+    fresh.startBridge();
+    // Shape mirrors the sidecar emit; handleBridgeLine is already exported.
+    fresh.handleBridgeLine(
+      JSON.stringify({
+        type: 'status',
+        panel: 'Vision MAX',
+        pm: 'PM-TEST',
+        sub: 'SUB-TEST',
+        fps: 10,
+        queue: 25,
+        frames: 100,
+      })
+    );
+    const status = fresh.computeLcdStatus();
+    expect(status.status).toBe('degraded');
+    expect(status.reason).toBe('bridge queue high (25)');
+  });
+
+  it('reaches degraded via exclusivityWarn once a child is live', async () => {
+    // Headless the warn alone cannot surface (the !bridgeChild guard fires
+    // first) — a live fake child moves compute past that guard.
+    execMode = 'holders';
+    try {
+      const fresh = loadFreshMain(() => makeFakeBridgeChild());
+      fresh.startBridge();
+      fresh.detectExclusivityHolders();
+      await flush();
+      const status = fresh.computeLcdStatus();
+      expect(status.status).toBe('degraded');
+      expect(status.reason).toContain('holds the LCD exclusively');
+    } finally {
+      execMode = 'empty';
+      execCalls.length = 0;
+    }
+  });
+
+  it('reaches degraded via lastPollError from bridge backpressure', () => {
+    // stdin.write -> false is the no-network route to lastPollError
+    // (src/main.js:941); throwing would take the write-failed sibling.
+    const fresh = loadFreshMain(() => makeFakeBridgeChild({ writeImpl: () => false }));
+    fresh.startBridge();
+    fresh.sendStateToBridge();
+    const status = fresh.computeLcdStatus();
+    expect(status.status).toBe('degraded');
+    expect(status.reason).toBe('bridge backpressure (stdin buffer full)');
+  });
+
+  it('reaches bridge-wedged when the watchdog sees >5s of silence', () => {
+    // check(futureMs) forces the episode synchronously — no real sleeps.
+    // onRestart kills the fake child (killCalls 1) without emitting exit,
+    // so bridgeChild stays truthy and the wedged branch is hit.
+    const kids = [];
+    const fresh = loadFreshMain(() => {
+      const c = makeFakeBridgeChild();
+      kids.push(c);
+      return c;
+    });
+    fresh.startBridge();
+    const fired = fresh.bridgeWatchdog.check(Date.now() + 6000);
+    expect(fired.wedged).toBe(true);
+    expect(kids[0].killCalls).toBe(1);
+    const status = fresh.computeLcdStatus();
+    expect(status.status).toBe('bridge-wedged');
+    expect(status.reason).toContain('no bridge status/ack for >5s');
+  });
+
+  it('reaches panel-unknown when the fake child exits with code 2', () => {
+    // No panel needed: the exit handler maps code 2 from any child.
+    const kids = [];
+    const fresh = loadFreshMain(() => {
+      const c = makeFakeBridgeChild();
+      kids.push(c);
+      return c;
+    });
+    fresh.startBridge();
+    expect(fresh.computeLcdStatus().status).toBe('ok');
+    kids[0].emit('exit', 2, null);
+    const status = fresh.computeLcdStatus();
+    expect(status.status).toBe('panel-unknown');
+    expect(status.reason).toBe('bridge refused an unknown panel (exit 2)');
+  });
+
+  it('reaches auth-error when pollNow cannot ensure a token (no network)', async () => {
+    // Empty vault (memoryTokens null + safeStorage unavailable stub) makes
+    // ensureAccessToken throw before any fetch, setting authBroken.
+    const fresh = loadFreshMain(() => makeFakeBridgeChild());
+    await fresh.pollNow();
+    const status = fresh.computeLcdStatus();
+    expect(status.status).toBe('auth-error');
+    expect(status.reason).toContain('not connected');
   });
 });

@@ -1,4 +1,10 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  useCallback,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -33,19 +39,28 @@ import {
  * background is active; on none/color they stay staged local drafts with an
  * explicit hint (committing them there would fail hardening.validateScene).
  * Staged drafts are carried into the first imported media background.
+ *
+ * DIRECT MANIPULATION (S2-T9): overlays are selected by click (preview or
+ * list) and moved/rotated/resized with pointer events. During a gesture only
+ * a local ghost — a CSS transform on the widget wrapper — updates; scene
+ * state (and therefore the debounced scene:preview IPC) does not move until
+ * pointerup, when the gesture-clamped values commit exactly once and the
+ * engine PNG follows. The renderer composes no pixels: the ghost is
+ * positioning guidance, the preview <img> stays the sidecar's output.
  */
 
 const PREVIEW_DEBOUNCE_MS = 250;
 const HEX_COLOR = /^#[0-9a-fA-F]{6}$/;
 const COLOR_FALLBACK = "#000000";
 
-type UnitField = "x" | "y" | "size";
+type UnitField = "x" | "y" | "size" | "rotation";
 type TransformField = "rotation" | "scale" | "panX" | "panY";
 
 const EMPTY_UNIT_DRAFTS: Record<UnitField, string> = {
   x: "0.5",
   y: "0.5",
   size: "0.1",
+  rotation: "0",
 };
 
 const INITIAL_TRANSFORM: Record<TransformField, string> = {
@@ -61,6 +76,29 @@ const TRANSFORM_RANGES: Record<TransformField, readonly [number, number]> = {
   panX: [-1, 1],
   panY: [-1, 1],
 };
+
+/**
+ * Per-field clamp ranges for the overlay inspector. x/y/size mirror the
+ * validator's [0,1] unit-fraction rule; rotation uses the same declared
+ * [-360,360] range as the background transform so the drag path and the
+ * numeric path commit through ONE gate.
+ */
+const UNIT_RANGES: Record<UnitField, readonly [number, number]> = {
+  x: [0, 1],
+  y: [0, 1],
+  size: [0, 1],
+  rotation: [-360, 360],
+};
+
+/** Declared overlay rotation range — inspector and rotation handle share it. */
+const OVERLAY_ROTATION_RANGE: readonly [number, number] = [-360, 360];
+
+/**
+ * Gesture-time floor for resize. The validator accepts size in [0,1], but a
+ * 0-size widget is invisible and ungrabbable, so the drag clamps at 0.01 —
+ * still inside the validator's range.
+ */
+const MIN_OVERLAY_SIZE = 0.01;
 
 /**
  * Draft-record pattern: unparseable input ("" or a trailing ".") stays a
@@ -94,6 +132,130 @@ function stagedValue(
 /** Transform fields are schema-bound to these kinds (video stays out of S2-T8b). */
 function isMediaKind(background: Background): background is Extract<Background, { kind: "image" | "gif" }> {
   return background.kind === "image" || background.kind === "gif";
+}
+
+// ---------------------------------------------------------------- gestures
+
+// S2-T9 direct manipulation. The ghost is a CSS transform evaluated on every
+// pointermove (0 ms, zero IPC); the engine PNG is requested only when scene
+// state changes — i.e. on release. Coordinates stay 0-1 normalized in
+// glass/portrait space; every px delta converts through the stage's MEASURED
+// rect, so a differently-sized preview (or DPR) maps correctly.
+
+type GestureMode = "move" | "resize" | "rotate";
+
+interface StageRect {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
+interface GestureState {
+  index: number;
+  mode: GestureMode;
+  pointerId: number;
+  startClientX: number;
+  startClientY: number;
+  clientX: number;
+  clientY: number;
+  /** Stage rect measured once at pointerdown; deltas never re-measure. */
+  rect: StageRect;
+  originX: number;
+  originY: number;
+  originSize: number;
+  originRotation: number;
+}
+
+interface OverlayPlacement {
+  x: number;
+  y: number;
+  size: number;
+  rotation: number;
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+/**
+ * Ghost math: current pointer -> placement, clamped DURING the gesture so
+ * neither the ghost nor the released scene can leave the ranges
+ * hardening.validateScene enforces (x/y/size in [0,1], rotation finite and
+ * inside the declared [-360,360]). Pure: called on every render while a
+ * gesture is live.
+ */
+function gesturePlacement(g: GestureState): OverlayPlacement {
+  const { rect, originX, originY, originSize, originRotation } = g;
+  const dx = g.clientX - g.startClientX;
+  const dy = g.clientY - g.startClientY;
+  if (g.mode === "move") {
+    // Clamp the PIXEL delta against the origin first so the ghost transform
+    // stays pixel-exact against the measured rect, then clamp the unit value
+    // again: float rounding at the edge could otherwise emit
+    // 1.0000000000000002 and fail the gate on release.
+    const dxPx = clampNumber(dx, -originX * rect.width, (1 - originX) * rect.width);
+    const dyPx = clampNumber(dy, -originY * rect.height, (1 - originY) * rect.height);
+    return {
+      x: clampNumber(originX + dxPx / rect.width, 0, 1),
+      y: clampNumber(originY + dyPx / rect.height, 0, 1),
+      size: originSize,
+      rotation: originRotation,
+    };
+  }
+  if (g.mode === "resize") {
+    // `size` is a fraction of CANVAS HEIGHT (the engine renders
+    // font_px = size * h), so normalize both axes in stage units and average
+    // them: the corner handle tracks the pointer on either axis.
+    const delta = (dx / rect.width + dy / rect.height) / 2;
+    return {
+      x: originX,
+      y: originY,
+      size: clampNumber(originSize + delta, MIN_OVERLAY_SIZE, 1),
+      rotation: originRotation,
+    };
+  }
+  // rotate: angle of the pointer around the widget anchor (the engine centers
+  // every overlay at (x, y)); +90 converts atan2's 0=right into 0=up, giving
+  // degrees that are clockwise-positive like the engine's Pillow
+  // rotate(-rotation). Delta is unwrapped past ±180 so crossing the top
+  // never snaps the ghost the long way around.
+  const cx = rect.left + originX * rect.width;
+  const cy = rect.top + originY * rect.height;
+  const angleAt = (px: number, py: number): number =>
+    Math.atan2(py - cy, px - cx) * (180 / Math.PI) + 90;
+  let delta = angleAt(g.clientX, g.clientY) - angleAt(g.startClientX, g.startClientY);
+  while (delta > 180) delta -= 360;
+  while (delta < -180) delta += 360;
+  return {
+    x: originX,
+    y: originY,
+    size: originSize,
+    rotation: clampNumber(
+      originRotation + delta,
+      OVERLAY_ROTATION_RANGE[0],
+      OVERLAY_ROTATION_RANGE[1]
+    ),
+  };
+}
+
+/**
+ * The ghost IS this string: the wrapper's static placement (left/top/height,
+ * from committed scene state) never moves mid-gesture — only the transform
+ * does. Zero deltas render the plain centering transform, so a released
+ * gesture leaves no residue behind.
+ */
+function overlayBoxTransform(
+  dxPx: number,
+  dyPx: number,
+  rotation: number,
+  scale: number
+): string {
+  const parts = ["translate(-50%, -50%)"];
+  if (dxPx !== 0 || dyPx !== 0) parts.push(`translate(${dxPx}px, ${dyPx}px)`);
+  if (rotation !== 0) parts.push(`rotate(${rotation}deg)`);
+  if (scale !== 1) parts.push(`scale(${scale})`);
+  return parts.join(" ");
 }
 
 // Keep in sync with the mediaImportError tokens in src/main.js (main process).
@@ -268,7 +430,24 @@ export default function SceneEditor({
   onSaved,
 }: SceneEditorProps) {
   // Ephemeral editor-local state (see file header).
-  const [selected, setSelected] = useState(0);
+  const [selected, setSelected] = useState<number | null>(0);
+  // Gesture bookkeeping: the ref is the source of truth for the window
+  // listeners (no stale closures); state only drives the ghost re-render.
+  const [gesture, setGestureState] = useState<GestureState | null>(null);
+  const gestureRef = useRef<GestureState | null>(null);
+  const stageRef = useRef<HTMLDivElement | null>(null);
+  // Teardown for the in-flight gesture's window listeners (unmount-safe).
+  const endGestureTracking = useRef<(() => void) | null>(null);
+  const setGesture = (next: GestureState | null) => {
+    gestureRef.current = next;
+    setGestureState(next);
+  };
+  useEffect(
+    () => () => {
+      endGestureTracking.current?.();
+    },
+    []
+  );
   const [unitDrafts, setUnitDrafts] = useState<Record<UnitField, string>>(
     EMPTY_UNIT_DRAFTS
   );
@@ -288,8 +467,11 @@ export default function SceneEditor({
   const previewTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const overlays = scene.overlays;
-  const safeIndex = Math.min(selected, Math.max(0, overlays.length - 1));
-  const selectedOverlay = overlays[safeIndex] ?? null;
+  const safeIndex =
+    selected === null ? -1 : Math.min(selected, Math.max(0, overlays.length - 1));
+  const selectedOverlay = safeIndex >= 0 ? (overlays[safeIndex] ?? null) : null;
+  // Recomputed per render while a gesture is live; pure (see gesturePlacement).
+  const ghost = gesture !== null ? gesturePlacement(gesture) : null;
   const backgroundKind = scene.background.kind;
   const backgroundColor =
     scene.background.kind === "color" ? scene.background.color : COLOR_FALLBACK;
@@ -299,10 +481,16 @@ export default function SceneEditor({
   // Keep drafts aligned with the selected overlay whenever the scene or the
   // selection changes (add/remove/switch/Reset all flow through here).
   useEffect(() => {
-    const overlay = scene.overlays[safeIndex] ?? null;
+    const overlay =
+      safeIndex >= 0 ? scene.overlays[safeIndex] ?? null : null;
     setUnitDrafts(
       overlay
-        ? { x: String(overlay.x), y: String(overlay.y), size: String(overlay.size) }
+        ? {
+            x: String(overlay.x),
+            y: String(overlay.y),
+            size: String(overlay.size),
+            rotation: String(overlay.rotation),
+          }
         : EMPTY_UNIT_DRAFTS
     );
   }, [scene, safeIndex]);
@@ -361,7 +549,12 @@ export default function SceneEditor({
 
   const setUnitDraft = (field: UnitField, value: string) =>
     setUnitDrafts((prev) => {
-      const next: Record<UnitField, string> = { x: prev.x, y: prev.y, size: prev.size };
+      const next: Record<UnitField, string> = {
+        x: prev.x,
+        y: prev.y,
+        size: prev.size,
+        rotation: prev.rotation,
+      };
       next[field] = value;
       return next;
     });
@@ -381,10 +574,119 @@ export default function SceneEditor({
   const commitOverlays = (next: Scene["overlays"]) =>
     onSceneChange({ ...scene, overlays: next });
 
+  /**
+   * pointerdown -> capture -> window pointermove/pointerup. Selection
+   * happens here (a tap IS a selection); scene state changes only in
+   * finish(true), so every move costs zero scene:preview requests and the
+   * release commits exactly once (one debounced preview follows). The
+   * `scene` closure is the snapshot from the render that saw pointerdown —
+   * safe because no other commit can run while a gesture holds the pointer.
+   */
+  const beginGesture = (
+    index: number,
+    mode: GestureMode,
+    e: ReactPointerEvent<HTMLElement>
+  ) => {
+    if (gestureRef.current) return; // one gesture at a time
+    if (e.button !== 0) return; // primary button / touch only
+    const overlay = scene.overlays[index];
+    const stage = stageRef.current;
+    if (!overlay) return;
+    setSelected(index);
+    if (!stage) return;
+    const rect = stage.getBoundingClientRect();
+    // No measurable stage (no layout yet): px->unit is undefined, so fall
+    // back to selection-only instead of committing NaN.
+    if (!(rect.width > 0) || !(rect.height > 0)) return;
+
+    setGesture({
+      index,
+      mode,
+      pointerId: e.pointerId,
+      startClientX: e.clientX,
+      startClientY: e.clientY,
+      clientX: e.clientX,
+      clientY: e.clientY,
+      rect: {
+        left: rect.left,
+        top: rect.top,
+        width: rect.width,
+        height: rect.height,
+      },
+      originX: overlay.x,
+      originY: overlay.y,
+      originSize: overlay.size,
+      originRotation: overlay.rotation,
+    });
+
+    // Capture keeps retargeting to the pressed element; the window listeners
+    // below are the delivery path (and the only one jsdom implements).
+    const captureTarget = e.currentTarget;
+    try {
+      captureTarget.setPointerCapture?.(e.pointerId);
+    } catch {
+      // capture is a progressive enhancement; listeners still receive moves
+    }
+    const releaseCapture = () => {
+      try {
+        if (captureTarget.hasPointerCapture?.(e.pointerId)) {
+          captureTarget.releasePointerCapture(e.pointerId);
+        }
+      } catch {
+        // pointercancel may have released the capture before this ran
+      }
+    };
+
+    const detach = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onCancel);
+      endGestureTracking.current = null;
+    };
+    const finish = (commit: boolean) => {
+      const g = gestureRef.current;
+      releaseCapture();
+      detach();
+      setGesture(null);
+      if (!commit || !g) return;
+      const placement = gesturePlacement(g);
+      if (
+        placement.x === g.originX &&
+        placement.y === g.originY &&
+        placement.size === g.originSize &&
+        placement.rotation === g.originRotation
+      ) {
+        return; // a plain tap selects but must not dirty the scene
+      }
+      commitOverlays(
+        scene.overlays.map((o, i) => (i === g.index ? { ...o, ...placement } : o))
+      );
+      setSavedNote(null);
+    };
+    const onMove = (ev: PointerEvent) => {
+      const g = gestureRef.current;
+      if (!g) return;
+      if (!Number.isFinite(ev.clientX) || !Number.isFinite(ev.clientY)) return;
+      setGesture({ ...g, clientX: ev.clientX, clientY: ev.clientY });
+    };
+    const onUp = () => finish(true);
+    // Cancel reverts: the ghost disappears, nothing commits.
+    const onCancel = () => finish(false);
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onCancel);
+    endGestureTracking.current = () => {
+      releaseCapture();
+      detach();
+      setGesture(null);
+    };
+  };
+
   const handleUnit = (field: UnitField, raw: string) => {
-    const result = stagedNumber(raw, 0, 1);
+    const [min, max] = UNIT_RANGES[field];
+    const result = stagedNumber(raw, min, max);
     setUnitDraft(field, result ? result.draft : raw);
-    if (!result || safeIndex >= overlays.length) return;
+    if (!result || safeIndex < 0 || safeIndex >= overlays.length) return;
     const overlaysNext = overlays.map((overlay, i) => {
       if (i !== safeIndex) return overlay;
       return {
@@ -392,6 +694,7 @@ export default function SceneEditor({
         x: field === "x" ? result.commit : overlay.x,
         y: field === "y" ? result.commit : overlay.y,
         size: field === "size" ? result.commit : overlay.size,
+        rotation: field === "rotation" ? result.commit : overlay.rotation,
       };
     });
     commitOverlays(overlaysNext);
@@ -528,7 +831,9 @@ export default function SceneEditor({
   };
 
   const removeOverlay = () => {
-    if (!overlays.length) return;
+    // safeIndex -1 = nothing selected (empty click deselected): filter(-1)
+    // would remove nothing yet still commit a dirty scene, so no-op instead.
+    if (safeIndex < 0 || !overlays.length) return;
     const next = overlays.filter((_, i) => i !== safeIndex);
     commitOverlays(next);
     setSelected(Math.max(0, Math.min(safeIndex, next.length - 1)));
@@ -807,6 +1112,15 @@ export default function SceneEditor({
               />
             </div>
             <div className="space-y-1">
+              <Label htmlFor="overlay-rotation">Overlay rotation (degrees)</Label>
+              <Input
+                id="overlay-rotation"
+                inputMode="decimal"
+                value={unitDrafts.rotation}
+                onChange={(e) => handleUnit("rotation", e.target.value)}
+              />
+            </div>
+            <div className="space-y-1">
               <Label htmlFor="overlay-color">Overlay color</Label>
               <Input
                 id="overlay-color"
@@ -821,12 +1135,111 @@ export default function SceneEditor({
         )}
       </div>
 
-      {/* Live preview: bytes rendered by the sidecar's engine on the panel. */}
+      {/* Live preview: bytes rendered by the sidecar's engine on the panel.
+          The overlay layer on top is GUIDANCE only — it composes no pixels;
+          the PNG below it stays the single source of truth. The stage fixes
+          the engine's 240x427 preview aspect; all gesture math converts px
+          through the stage's measured rect, never through a hard constant. */}
       <div className="space-y-2">
         <p className="text-sm font-medium">Preview</p>
         <div className="flex aspect-[3/2] w-full items-center justify-center overflow-hidden rounded-md border bg-black/40">
           {previewUrl ? (
-            <img src={previewUrl} alt="Scene preview" className="max-h-full max-w-full" />
+            <div
+              ref={stageRef}
+              className="relative h-full aspect-[240/427] [container-type:size]"
+            >
+              <img
+                src={previewUrl}
+                alt="Scene preview"
+                className="absolute inset-0 h-full w-full"
+              />
+              <div
+                className="absolute inset-0 touch-none select-none"
+                onPointerDown={(e) => {
+                  // Empty space deselects; widget hits start their own gesture.
+                  if (e.target === e.currentTarget) setSelected(null);
+                }}
+              >
+                {overlays.map((overlay, index) => {
+                  const gesturing =
+                    gesture !== null && ghost !== null && gesture.index === index;
+                  const placement = gesturing && ghost ? ghost : overlay;
+                  const dxPx =
+                    gesturing && gesture
+                      ? (placement.x - overlay.x) * gesture.rect.width
+                      : 0;
+                  const dyPx =
+                    gesturing && gesture
+                      ? (placement.y - overlay.y) * gesture.rect.height
+                      : 0;
+                  const scale =
+                    gesturing && overlay.size > 0 ? placement.size / overlay.size : 1;
+                  const isSelected = safeIndex === index;
+                  return (
+                    <div
+                      key={`preview-overlay-${index}`}
+                      data-dragging={gesturing ? "true" : undefined}
+                      className="absolute"
+                      style={{
+                        left: `${overlay.x * 100}%`,
+                        top: `${overlay.y * 100}%`,
+                        height: `${overlay.size * 100}%`,
+                        transform: overlayBoxTransform(
+                          dxPx,
+                          dyPx,
+                          placement.rotation,
+                          scale
+                        ),
+                      }}
+                    >
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="ghost"
+                        aria-label={`Select overlay ${index + 1}`}
+                        aria-pressed={isSelected}
+                        className={`h-full rounded-sm border border-dashed px-1 ${
+                          isSelected ? "border-primary" : "border-white/50"
+                        }`}
+                        style={{
+                          // size is a fraction of canvas HEIGHT (the engine's
+                          // font_px = size * h); cqh expresses exactly that
+                          // against the size-container stage.
+                          fontSize: `${overlay.size * 100}cqh`,
+                          color: overlay.color,
+                        }}
+                        onPointerDown={(e) => beginGesture(index, "move", e)}
+                        onClick={() => setSelected(index)}
+                      >
+                        {/* gpu-temp has no renderer until S4-T15: an honest
+                            empty box, never phantom data. */}
+                        {overlay.kind === "text" ? overlay.text : ""}
+                      </Button>
+                      {isSelected && (
+                        <>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="secondary"
+                            aria-label={`Resize overlay ${index + 1}`}
+                            className="absolute -bottom-1.5 -right-1.5 h-3 w-3 rounded-full p-0"
+                            onPointerDown={(e) => beginGesture(index, "resize", e)}
+                          />
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="secondary"
+                            aria-label={`Rotate overlay ${index + 1}`}
+                            className="absolute left-1/2 -top-1.5 h-3 w-3 -translate-x-1/2 rounded-full p-0"
+                            onPointerDown={(e) => beginGesture(index, "rotate", e)}
+                          />
+                        </>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
           ) : (
             <p className="text-xs text-muted-foreground">Waiting for the panel…</p>
           )}

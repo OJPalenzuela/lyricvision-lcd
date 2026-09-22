@@ -1,6 +1,7 @@
-"""Smoke test for bridge/lcd_bridge.py (LV-04). Plain asserts, no runner needed.
+"""Smoke test for bridge/lcd_bridge.py (LV-04). pytest-collectable AND script-runnable.
 
-Run from the repo root either way:
+Run from the repo root any of these ways:
+    .venv/Scripts/python.exe -m pytest tests/test_bridge.py -v
     python tests/test_bridge.py
     python -m tests.test_bridge
 """
@@ -41,12 +42,12 @@ class FakeEndpoint:
         raise AssertionError("read should not be called in send_frame tests")
 
 
-def main() -> None:
+def test_rotation_mapping() -> None:
     from PIL import Image
 
-    # 1. Rotation mapping (glass-verified sense): portrait top-blue/bottom-red
-    #    -> buffer left-red/right-blue via rot90cw; inverse buffer pattern
-    #    -> portrait top-blue/bottom-red.
+    # Rotation mapping (glass-verified sense): portrait top-blue/bottom-red
+    # -> buffer left-red/right-blue via rot90cw; inverse buffer pattern
+    # -> portrait top-blue/bottom-red.
     W, H = 480, 854
     portrait = Image.new("RGB", (W, H))
     for y in range(H):
@@ -66,7 +67,9 @@ def main() -> None:
     assert back.getpixel((240, 0)) == (0, 0, 255), "portrait top must be blue"
     assert back.getpixel((240, 853)) == (255, 0, 0), "portrait bottom must be red"
 
-    # 2. Header goes through the protocol builder with w=854 h=480.
+
+def test_send_frame_header() -> None:
+    # Header goes through the protocol builder with w=854 h=480.
     fake = FakeEndpoint()
     payload = bytes(range(256)) * 4  # 1024 bytes
     lcd_bridge.send_frame(fake, VISION_MAX, payload)
@@ -82,7 +85,9 @@ def main() -> None:
     body = b"".join(w for w in fake.writes[1:] if w)
     assert body == payload, "chunked payload must reassemble exactly"
 
-    # 3. Unknown PM exits 2 with a panel-unknown status line (mocked USB).
+
+def test_unknown_panel_exit2() -> None:
+    # Unknown PM exits 2 with a panel-unknown status line (mocked USB).
     assert lookup(99, 99).known is False
     try:
         lcd_bridge.resolve_panel(99, 99)
@@ -107,7 +112,9 @@ def main() -> None:
     assert code == 2, code
     assert "panel-unknown" in captured.getvalue(), captured.getvalue()
 
-    # 4. fps clamp: default 10, floor 5, ceiling 30.
+
+def test_fps_clamp() -> None:
+    # fps clamp: default 10, floor 5, ceiling 30.
     assert lcd_bridge.clamp_fps(None) == 10
     assert lcd_bridge.clamp_fps("garbage") == 10
     assert lcd_bridge.clamp_fps(2) == 5
@@ -121,7 +128,9 @@ def main() -> None:
     assert lcd_bridge.fps_from_state({"settings": {"lcdFps": 60}}) == 30
     assert lcd_bridge.fps_from_state({"settings": {"lcdFps": 15}}) == 15
 
-    # 5. Stdin envelopes: versioned + legacy.
+
+def test_stdin_envelopes() -> None:
+    # Stdin envelopes: versioned + legacy.
     seq, state = lcd_bridge.parse_state_line(
         '{"v":1,"seq":7,"cmd":"state","state":{"track":{"title":"T"}}}'
     )
@@ -133,8 +142,10 @@ def main() -> None:
     assert lcd_bridge.parse_state_line("not json") == (None, None)
     assert lcd_bridge.parse_state_line("") == (None, None)
 
-    # 6. UTF-8 stdin: lyrics survive the bytes->str decode (Windows cp1252
-    #    would mangle them into mojibake like "canciÃ³n").
+
+def test_utf8_stdin() -> None:
+    # UTF-8 stdin: lyrics survive the bytes->str decode (Windows cp1252
+    # would mangle them into mojibake like "canciÃ³n").
     import json as _json
 
     lyric = {"track": {"title": "Corazón ñoño 日本語 🎵"}}
@@ -145,9 +156,11 @@ def main() -> None:
     assert state == lyric, state
     assert "Ã" not in state["track"]["title"], state
 
-    # 7. LV-08 sync progress: timestamp base with frozen now, updatedAt
-    #    fallback, clamp, static fallback, and extract_display wiring.
-    #    Playing states extrapolate; paused states stay static (no time drift).
+
+def test_sync_progress() -> None:
+    # LV-08 sync progress: timestamp base with frozen now, updatedAt
+    # fallback, clamp, static fallback, and extract_display wiring.
+    # Playing states extrapolate; paused states stay static (no time drift).
     base = {"progressMs": 10000, "measuredAt": 1000000, "offsetMs": 0, "isPlaying": True}
     assert lcd_bridge.current_progress(base, 1002500) == 12500
     assert lcd_bridge.current_progress({**base, "offsetMs": -1500}, 1002500) == 11000
@@ -190,6 +203,16 @@ def main() -> None:
     assert frozen["isPlaying"] is False, frozen
     legacy = lcd_bridge.extract_display({"progressMs": 45000, "durationMs": 180000}, now_ms=9999999)
     assert legacy["progressMs"] == 45000, legacy
+
+
+def main() -> None:
+    test_rotation_mapping()
+    test_send_frame_header()
+    test_unknown_panel_exit2()
+    test_fps_clamp()
+    test_stdin_envelopes()
+    test_utf8_stdin()
+    test_sync_progress()
 
     print("test_bridge: OK (rotation + header 854x480 + exit2 + fps clamp + envelopes + sync progress)")
 

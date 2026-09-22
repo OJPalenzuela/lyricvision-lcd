@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "agents-generator": {
+      "source": "OJPalenzuela/agents-generator",
+      "sourceType": "github",
+      "skillPath": "SKILL.md",
+      "computedHash": "dcb68db21fca13f59a76997e954caa36f072e6cf58a5a0c8dd0cd558ed6c5806"
+    }
+  }
+}

@@ -1,6 +1,7 @@
-"""Smoke test for bridge/protocol.py. Plain asserts, no runner needed.
+"""Smoke test for bridge/protocol.py. pytest-collectable AND script-runnable.
 
-Run from the repo root either way:
+Run from the repo root any of these ways:
+    .venv/Scripts/python.exe -m pytest tests/test_protocol.py -v
     python tests/test_protocol.py
     python -m tests.test_protocol
 """
@@ -39,11 +40,12 @@ def real_handshake_vector() -> bytes:
     return bytes(resp)
 
 
-def main() -> None:
-    # Handshake parse with the real PM11/SUB5 vector.
+def test_handshake_parses_real_vector() -> None:
     pm, sub = parse_handshake(real_handshake_vector())
     assert (pm, sub) == (11, 5), (pm, sub)
 
+
+def test_handshake_short_raises() -> None:
     # Short responses must raise, never return a guessed default.
     try:
         parse_handshake(b"\x00" * 10)
@@ -52,7 +54,8 @@ def main() -> None:
     else:
         raise AssertionError("short handshake must raise ValueError")
 
-    # Header builder: offsets, endianness, and size.
+
+def test_frame_header_layout() -> None:
     header = build_frame_header(854, 480, CMD_FRAME, 1894)
     assert len(header) == HEADER_SIZE == 64, len(header)
     assert struct.unpack_from("<I", header, OFF_MAGIC)[0] == MAGIC
@@ -63,30 +66,47 @@ def main() -> None:
     assert header[OFF_MODE] == MODE_JPEG == 2
     assert struct.unpack_from("<I", header, OFF_PAYLOAD_LEN)[0] == 1894
 
-    # Chunk/ZLP rule: 1894 % 512 == 358 -> single chunk, no ZLP.
+
+def test_chunks_single_without_zlp() -> None:
+    # 1894 % 512 == 358 -> single chunk, no ZLP.
     assert 1894 % BULK_PACKET == 358
     chunks = list(iter_chunks(bytes(1894)))
     assert len(chunks) == 1, len(chunks)
     assert len(chunks[0][0]) == 1894
     assert chunks[0][1] is False, "1894-byte payload must not need ZLP"
 
-    # ZLP-positive case: payload ending exactly on a packet boundary.
+
+def test_chunks_zlp_on_packet_boundary() -> None:
     chunks = list(iter_chunks(bytes(1024)))
     assert len(chunks) == 1 and chunks[0][1] is True, "1024 % 512 == 0 needs ZLP"
 
-    # Multi-chunk case: only the last chunk may carry the ZLP flag.
+
+def test_chunks_multi_only_last_needs_zlp() -> None:
     payload = bytes(16 * 1024 + 512)  # total % 512 == 0
     chunks = list(iter_chunks(payload))
     assert len(chunks) == 2, len(chunks)
     assert chunks[0] == (payload[: 16 * 1024], False), "first chunk never needs ZLP"
     assert chunks[1][1] is True, "last chunk on a packet boundary needs ZLP"
 
-    # Non-aligned multi-chunk: no ZLP anywhere.
+
+def test_chunks_multi_no_zlp_when_unaligned() -> None:
     chunks = list(iter_chunks(bytes(16 * 1024 + 100)))
     assert [flag for _, flag in chunks] == [False, False]
 
-    # Empty payload yields nothing.
+
+def test_chunks_empty_yields_nothing() -> None:
     assert list(iter_chunks(b"")) == []
+
+
+def main() -> None:
+    test_handshake_parses_real_vector()
+    test_handshake_short_raises()
+    test_frame_header_layout()
+    test_chunks_single_without_zlp()
+    test_chunks_zlp_on_packet_boundary()
+    test_chunks_multi_only_last_needs_zlp()
+    test_chunks_multi_no_zlp_when_unaligned()
+    test_chunks_empty_yields_nothing()
 
     print("test_protocol: OK (handshake + header + chunk/ZLP)")
 

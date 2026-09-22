@@ -1129,7 +1129,17 @@ def run_preview(path: str, layout: str = "lyrics") -> int:
 def _stdin_reader(stop: threading.Event, pending: "queue.Queue[Tuple[Optional[int], Dict[str, Any]]]"):
     # Read bytes on purpose: the OS locale encoding on Windows (cp1252)
     # would mangle UTF-8 lyrics, so decode explicitly as UTF-8 here.
-    stream = sys.stdin.buffer if hasattr(sys.stdin, "buffer") else sys.stdin
+    #
+    # Read from a DUP of fd 0, never sys.stdin: a daemon parked in a blocking
+    # read holds its BufferedReader lock, and interpreter shutdown must finalize
+    # sys.stdin — contending there is the fatal `_enter_buffered_busy` abort
+    # (exit 0xC0000005). A separate buffer is finalized uncontended, so a reader
+    # left alive by an early return before the render loop is safe to abandon.
+    try:
+        stream = os.fdopen(os.dup(0), "rb")
+    except OSError:
+        # fd 0 unusable means it is already closed, so stdin is at EOF here.
+        stream = sys.stdin.buffer if hasattr(sys.stdin, "buffer") else sys.stdin
     for raw_bytes in stream:
         if stop.is_set():
             break
@@ -1166,6 +1176,16 @@ def main(argv=None) -> int:
         log("error: --once N requires N >= 1")
         return 1
 
+    # Start draining stdin BEFORE the USB bring-up. The shell writes state the
+    # moment it spawns us (setImmediate after spawn in src/main.js), and those
+    # envelopes must be queued before frame 1 — otherwise frame 1 renders the
+    # default layout and acks nothing, which is what left
+    # tests/test_shell_spawn.js with 2 acks for 3 frames.
+    pending: "queue.Queue[Tuple[Optional[int], Dict[str, Any]]]" = queue.Queue(maxsize=30)
+    stop = threading.Event()
+    reader = threading.Thread(target=_stdin_reader, args=(stop, pending), daemon=True)
+    reader.start()
+
     # --- Open + handshake once (via protocol.py), then registry lookup. ---
     try:
         dev, ep_out, ep_in = open_device(args.serial)
@@ -1173,6 +1193,7 @@ def main(argv=None) -> int:
         emit({"type": "status", "status": exc.status,
               "message": str(exc), "queue": 0, "frames": 0})
         log(f"error: {exc}")
+        stop.set()
         return 3
 
     try:
@@ -1182,6 +1203,7 @@ def main(argv=None) -> int:
               "message": str(exc), "queue": 0, "frames": 0})
         log(f"error: {exc}")
         close_device(dev)
+        stop.set()
         return 3
 
     try:
@@ -1190,17 +1212,13 @@ def main(argv=None) -> int:
         emit(unknown_status(exc.pm, exc.sub))
         log(f"error: {exc}")
         close_device(dev)
+        stop.set()
         return 2
 
     glass = profile.glass_size if profile.glass_size != (0, 0) else DEFAULT_GLASS
     log(f"panel: {profile.name} (PM={pm} SUB={sub}), "
         f"glass {glass[0]}x{glass[1]} -> buffer "
         f"{profile.buffer_size[0]}x{profile.buffer_size[1]}")
-
-    pending: "queue.Queue[Tuple[Optional[int], Dict[str, Any]]]" = queue.Queue(maxsize=30)
-    stop = threading.Event()
-    reader = threading.Thread(target=_stdin_reader, args=(stop, pending), daemon=True)
-    reader.start()
 
     state: Dict[str, Any] = {}
     seq: Optional[int] = None

@@ -1,9 +1,10 @@
-"""Smoke test for LV-09 unified layout (plain asserts, no runner needed).
+"""Smoke test for LV-09 unified layout. pytest-collectable AND script-runnable.
 
 Single portrait view 480x854: art + title/artist/album + current (+ next
 attenuated) + play/pause icon + cur/total time + proportional bar.
 
-Run from the repo root either way:
+Run from the repo root any of these ways:
+    .venv/Scripts/python.exe -m pytest tests/test_cover.py -v
     python tests/test_cover.py
     python -m tests.test_cover
 """
@@ -51,10 +52,10 @@ def _bar_frac(img):
     return fill / bar_w
 
 
-def main() -> None:
-    from PIL import Image, ImageDraw
+def test_art_lru() -> None:
+    # LRU intacta: 30 entries fit, the 31st evicts the oldest.
+    from PIL import Image
 
-    # 1. LRU intacta: 30 entries fit, the 31st evicts the oldest.
     lcd_bridge.clear_art_cache()
     for i in range(30):
         lcd_bridge._art_cache_put(
@@ -74,7 +75,11 @@ def main() -> None:
     lcd_bridge.clear_art_cache()
     assert len(lcd_bridge._art_cache) == 0
 
-    # 2. Fallback sin arte nunca levanta (empty + None + bad-shape URLs).
+
+def test_artwork_fallback_never_raises() -> None:
+    from PIL import Image, ImageDraw
+
+    # Fallback sin arte nunca levanta (empty + None + bad-shape URLs).
     for bad in ("", None, 123, {}, []):
         state = _unified_state(
             track={"title": "T", "artist": "A", "album": "Al", "artworkUrl": bad}
@@ -100,7 +105,9 @@ def main() -> None:
     lcd_bridge.draw_pause_icon(d, 10, 40, 22)
     lcd_bridge.draw_note_icon(d, 50, 50, 40)
 
-    # 3. m:ss format.
+
+def test_format_time() -> None:
+    # m:ss format.
     assert lcd_bridge.format_time(0) == "0:00"
     assert lcd_bridge.format_time(1000) == "0:01"
     assert lcd_bridge.format_time(61000) == "1:01"
@@ -112,7 +119,9 @@ def main() -> None:
     for garbage in (None, "abc", float("nan"), True, {}, []):
         assert lcd_bridge.format_time(garbage) == "0:00", garbage
 
-    # 4. Unificado 480x854 + rotacion a 854x480; dispatcher siempre unificado.
+
+def test_unified_layout_ignored() -> None:
+    # Unificado 480x854 + rotacion a 854x480; dispatcher siempre unificado.
     lcd_bridge.clear_art_cache()
     unified = lcd_bridge.render_unified(_unified_state(), now_ms=1700000000000)
     assert unified.size == (480, 854), unified.size
@@ -142,7 +151,9 @@ def main() -> None:
     assert lcd_bridge.demo_state("lyrics")["progressMs"] == lcd_bridge.demo_state("cover")["progressMs"]
     lcd_bridge.clear_art_cache()
 
-    # 5. Tiempo avanza entre states + barra proporcional (frozen clock).
+
+def test_time_advance_proportional_bar() -> None:
+    # Tiempo avanza entre states + barra proporcional (frozen clock).
     frozen_base = 1700000000000
     frozen_now = frozen_base + 10000
     early = _unified_state(progressMs=30000, measuredAt=frozen_base, durationMs=180000)
@@ -163,8 +174,11 @@ def main() -> None:
     assert abs(f_late - 100000 / 180000) < 0.10, (f_late, "expected ~0.55")
     lcd_bridge.clear_art_cache()
 
-    # 5b. Paused freeze (regression): same paused base at two clocks ->
+
+def test_paused_freeze() -> None:
+    # Paused freeze (regression): same paused base at two clocks ->
     # identical progress, time, and bar (nothing advances while paused).
+    frozen_base = 1700000000000
     frozen_paused = _unified_state(
         progressMs=30000, measuredAt=frozen_base, durationMs=180000, isPlaying=False)
     p1 = lcd_bridge.extract_display(frozen_paused, now_ms=frozen_base + 1000)
@@ -178,7 +192,9 @@ def main() -> None:
     assert _bar_frac(img_p1) == _bar_frac(img_p2)
     lcd_bridge.clear_art_cache()
 
-    # 6. Regresion bug A: measuredAt=0 (sentinel viejo) -> estatico, no ~29M min.
+
+def test_measured_at_sentinel_regression() -> None:
+    # Regresion bug A: measuredAt=0 (sentinel viejo) -> estatico, no ~29M min.
     assert lcd_bridge.current_progress({"progressMs": 10000, "measuredAt": 0}, 1700000000000) == 10000
     assert lcd_bridge.current_progress({"progressMs": 10000, "measuredAt": -5}, 1700000000000) == 10000
     assert lcd_bridge.current_progress({"progressMs": 0, "measuredAt": 0}, 1700000000000) == 0
@@ -201,7 +217,9 @@ def main() -> None:
     assert f2 > f1, (f1, f2)
     lcd_bridge.clear_art_cache()
 
-    # 7. Whitelist compat: se acepta pero se ignora al renderizar.
+
+def test_layout_whitelist_compat() -> None:
+    # Whitelist compat: se acepta pero se ignora al renderizar.
     assert lcd_bridge.is_valid_layout("lyrics") is True
     assert lcd_bridge.is_valid_layout("cover") is True
     for bad in ("grid", "", " ", None, 123, 1.5, True, False, [], {}, b"lyrics",
@@ -213,6 +231,17 @@ def main() -> None:
         assert lcd_bridge.normalize_layout(bad) == "lyrics", repr(bad)
     shown = lcd_bridge.extract_display(_unified_state(), now_ms=1700000000000)
     assert shown["album"] == "Mockup", shown
+
+
+def main() -> None:
+    test_art_lru()
+    test_artwork_fallback_never_raises()
+    test_format_time()
+    test_unified_layout_ignored()
+    test_time_advance_proportional_bar()
+    test_paused_freeze()
+    test_measured_at_sentinel_regression()
+    test_layout_whitelist_compat()
 
     print("test_cover: OK (unified 480x854->854x480 + time advance + proportional bar + fallback + lru + sentinel regression)")
 

@@ -8,3 +8,7 @@ allowBuilds:
 # binary is fetched on demand via the `install-electron` bin).
 # electron-winstaller (transitive via electron-builder, Squirrel.Windows
 # vendor tools) does need approval. The v0.1 package target is nsis only.
+minimumReleaseAgeExclude:
+  - html-encoding-sniffer@7.0.0
+  - jsdom@30.1.1
+  - w3c-xmlserializer@6.0.0

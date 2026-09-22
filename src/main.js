@@ -1206,7 +1206,11 @@ function createWindow() {
       sandbox: true,
     },
   });
-  mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+  if (process.env.ELECTRON_RENDERER_URL) {
+    mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL);
+  } else {
+    mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'renderer', 'index.html'));
+  }
   // CSP is enforced by the meta tag in index.html; deny ALL popup windows here.
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   mainWindow.on('close', (event) => {
@@ -1500,4 +1504,24 @@ module.exports = {
   buildBridgeState,
   buildBridgeEnvelope,
   redact,
+  base64url,
+  OAUTH_PORT_START,
+  OAUTH_PORT_END,
+  listenOnFirstFreePort,
+  closeOAuthServer,
+  LYRICS_CACHE_MAX,
+  LYRICS_CACHE_TTL_MS,
+  lyricsCacheKey,
+  cacheGet,
+  cacheSet,
+  scoreSearchResult,
+  detectExclusivityHolders,
+  computeLcdStatus,
+  bridgeStatusLine,
+  getLcdStatus,
+  buildDiagnosticsPayload,
+  diagnosticsFilePath,
+  currentTrackKey,
+  createTray,
+  createWindow,
 };

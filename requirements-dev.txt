@@ -1,0 +1,4 @@
+# Dev-only Python test dependency (installed into the project-local .venv).
+# Reproducible install from the repo root (Windows):
+#   .venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+pytest==9.1.1

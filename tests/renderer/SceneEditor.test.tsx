@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { createRequire } from "node:module";
 import { describe, expect, it, vi, type Mock } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import App from "@/App";
@@ -588,5 +588,158 @@ describe("overlay text length gate", () => {
     expect(scene.overlays[0]).toMatchObject({ text: "a".repeat(4096) });
     expect(hardening.validateScene(scene).ok).toBe(true);
     expect(screen.getByLabelText("Overlay text")).toHaveValue("a".repeat(4096));
+  });
+
+  // The lower edge of the same gate: both validators require only a string
+  // under the cap, so clearing the field is a legal commit — not a no-op
+  // that would snap the controlled input back to the previous text.
+  it("commits an empty overlay text that still passes both gates", async () => {
+    const { onChange, user } = setup();
+    await user.click(screen.getByRole("button", { name: "Add text overlay" }));
+    await user.clear(screen.getByLabelText("Overlay text"));
+    expect(lastScene(onChange).overlays[0]).toMatchObject({ text: "" });
+    expect(hardening.validateScene(lastScene(onChange)).ok).toBe(true);
+  });
+});
+
+describe("background kind switching (S2-T10)", () => {
+  // The switch handlers REBUILD the background per kind, so switching away
+  // from media must drop source/transform keys entirely (the gate rejects
+  // unknown keys per kind) and a cancelled re-import must not resurrect
+  // them. Staged transform drafts live in editor state and are carried
+  // across every switch into the next imported media background.
+  it("walks none/color/image/gif without leaking media keys or losing staged drafts", async () => {
+    const { bridge, onChange, user } = setup(
+      sceneWithMedia("image", { rotation: 45 }),
+      (stub) => {
+        // One file per pick: GIF first, then PNG; a third pick falls back to
+        // the base stub (null = cancelled dialog).
+        stub.importMedia
+          .mockResolvedValueOnce(GIF_DATA_URL)
+          .mockResolvedValueOnce(PNG_DATA_URL);
+      }
+    );
+    const pressed = (name: "None" | "Color" | "Image" | "GIF"): string | null =>
+      screen.getByRole("button", { name }).getAttribute("aria-pressed");
+
+    expect(pressed("Image")).toBe("true");
+    expect(screen.getByLabelText("Rotation (degrees)")).toHaveValue("45");
+    expect(
+      screen.queryByText(/Pick an image or GIF background/)
+    ).not.toBeInTheDocument();
+
+    // image -> color: exact shape — no source, no transform keys ride along.
+    await user.click(screen.getByRole("button", { name: "Color" }));
+    expect(lastScene(onChange).background).toEqual({
+      kind: "color",
+      color: "#000000",
+    });
+    expect(hardening.validateScene(lastScene(onChange)).ok).toBe(true);
+    expect(pressed("Color")).toBe("true");
+    expect(pressed("Image")).toBe("false");
+    // The transform draft stays staged and visible instead of vanishing
+    // with the media background it came from.
+    expect(screen.getByLabelText("Rotation (degrees)")).toHaveValue("45");
+    expect(
+      screen.getByText(/Pick an image or GIF background to commit these values\./)
+    ).toBeInTheDocument();
+
+    // color -> none.
+    await user.click(screen.getByRole("button", { name: "None" }));
+    expect(lastScene(onChange).background).toEqual({ kind: "none" });
+    expect(hardening.validateScene(lastScene(onChange)).ok).toBe(true);
+    expect(pressed("None")).toBe("true");
+
+    // none -> gif: a fresh import; the staged rotation is carried in.
+    await user.click(screen.getByRole("button", { name: "GIF" }));
+    await waitFor(() => expect(bridge.importMedia).toHaveBeenCalledWith("gif"));
+    expect(lastScene(onChange).background).toMatchObject({
+      kind: "gif",
+      source: GIF_DATA_URL,
+      rotation: 45,
+    });
+    expect(hardening.validateScene(lastScene(onChange)).ok).toBe(true);
+    expect(pressed("GIF")).toBe("true");
+
+    // gif -> image: the source is REPLACED by the new pick, never merged.
+    await user.click(screen.getByRole("button", { name: "Image" }));
+    await waitFor(() => expect(bridge.importMedia).toHaveBeenCalledWith("image"));
+    expect(lastScene(onChange).background).toMatchObject({
+      kind: "image",
+      source: PNG_DATA_URL,
+      rotation: 45,
+    });
+    expect(hardening.validateScene(lastScene(onChange)).ok).toBe(true);
+    expect(pressed("Image")).toBe("true");
+
+    // image -> color drops the embedded source once more.
+    await user.click(screen.getByRole("button", { name: "Color" }));
+    expect(lastScene(onChange).background).toEqual({
+      kind: "color",
+      color: "#000000",
+    });
+    expect(hardening.validateScene(lastScene(onChange)).ok).toBe(true);
+
+    // The Once-chain is exhausted, so this pick resolves null = cancelled:
+    // switching back to a media kind must NOT resurrect the dropped source.
+    onChange.mockClear();
+    await user.click(screen.getByRole("button", { name: "Image" }));
+    await waitFor(() => expect(bridge.importMedia).toHaveBeenCalledTimes(3));
+    expect(onChange).not.toHaveBeenCalled();
+    expect(pressed("Color")).toBe("true");
+    expect(screen.queryByText(/In use:/)).not.toBeInTheDocument();
+  });
+});
+
+describe("scene round trip through App (S2-T10)", () => {
+  // App owns the scene (getSettings boot load -> setScene, onSceneChange,
+  // onSaved refreshing the Reset baseline). The existing App test only
+  // proves the surface renders; this walks the full persisted -> edited ->
+  // saved -> reset cycle through the real wiring in App.tsx.
+  it("boots from the persisted scene, saves an edit, and makes that save the Reset baseline", async () => {
+    const bridge = makeBridge();
+    const bootScene: Scene = {
+      ...DEFAULT_SCENE,
+      overlays: [textOverlay("Boot line")],
+    };
+    bridge.getSettings = vi.fn(async () => ({
+      settings: { ...DEFAULT_SETTINGS, scene: bootScene },
+      spotify: { connected: false },
+      startupSupported: true,
+    }));
+    window.lyricvision = bridge;
+    const user = userEvent.setup();
+    render(<App />);
+    await waitFor(() => expect(bridge.getSettings).toHaveBeenCalled());
+
+    await user.click(screen.getByRole("button", { name: "Scene editor" }));
+    const sceneSection = screen.getByRole("region", { name: "Scene" });
+    const input = within(sceneSection).getByLabelText(
+      "Overlay text"
+    ) as HTMLInputElement;
+    // The PERSISTED scene reached the editor, not the mount-time default.
+    expect(input).toHaveValue("Boot line");
+
+    await user.clear(input);
+    await user.type(input, "Saved line");
+    await user.click(
+      within(sceneSection).getByRole("button", { name: "Save scene" })
+    );
+    await waitFor(() => expect(bridge.saveSettings).toHaveBeenCalledTimes(1));
+    const patch = bridge.saveSettings.mock.calls[0][0];
+    if (!patch.scene) throw new Error("scene missing from the save patch");
+    expect(patch.scene.overlays[0]).toMatchObject({ text: "Saved line" });
+    expect(hardening.validateScene(patch.scene).ok).toBe(true);
+
+    // An unsaved edit after the save: Reset must revert to the SAVED scene,
+    // which only happens if onSaved refreshed App's reset baseline.
+    await user.clear(screen.getByLabelText("Overlay text"));
+    await user.type(screen.getByLabelText("Overlay text"), "Draft line");
+    await user.click(
+      within(sceneSection).getByRole("button", { name: "Reset" })
+    );
+    expect(within(sceneSection).getByLabelText("Overlay text")).toHaveValue(
+      "Saved line"
+    );
   });
 });

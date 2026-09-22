@@ -461,3 +461,33 @@ describe("S2-T9 overlay cap under drag", () => {
     expect(hardening.validateScene(scene).ok).toBe(true);
   });
 });
+
+describe("S2-T9 inspector edit then drag", () => {
+  it("takes the drag origin from the freshly committed inspector value, not a stale draft", async () => {
+    const { onChange } = setup(sceneWithOverlays([textOverlay("Hi")]));
+    await previewReady();
+    stubStageRect();
+
+    // Commit a new x through the inspector first: the gesture must read its
+    // origin from THIS scene, not from the mount-time value (0.5).
+    const x = screen.getByLabelText("Overlay X (0-1)") as HTMLInputElement;
+    fireEvent.change(x, { target: { value: "0.25" } });
+    expect(lastScene(onChange).overlays[0].x).toBe(0.25);
+    expect(x.value).toBe("0.25");
+
+    // +60 px on the 240 px stage = +0.25, so 0.25 + 0.25 = 0.5. A stale
+    // origin of 0.5 would commit 0.75 instead — both failure modes (stale
+    // origin, gesture never running and leaving 0.25) miss this assertion.
+    const box = screen.getByRole("button", { name: "Select overlay 1" });
+    pdown(box);
+    pmove(window, { clientX: 280, clientY: 263.5 });
+    pup(window, { clientX: 280, clientY: 263.5 });
+
+    const scene = lastScene(onChange);
+    expect(scene.overlays[0].x).toBeCloseTo(0.5, 6);
+    expect(scene.overlays[0].y).toBe(0.5);
+    expect(hardening.validateScene(scene).ok).toBe(true);
+    // The inspector reads back the committed drag value.
+    await waitFor(() => expect(Number(x.value)).toBeCloseTo(0.5, 6));
+  });
+});

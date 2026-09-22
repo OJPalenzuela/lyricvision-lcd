@@ -993,12 +993,81 @@ def _warn_scene_fallback(exc: BaseException) -> None:
 _SCENE_FALLBACK_LAST: Optional[str] = None
 
 
+def apply_scene_retention(
+    state: Dict[str, Any], last: Optional[Dict[str, Any]]
+) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    """Resolve the RETAINED `settings.scene` field of one drained envelope.
+
+    WHY ABSENT MEANS RETAIN HERE -- and nowhere else: the envelope stays a
+    full replacement for EVERY other field (lcdFps, lyric, track,
+    isPlaying, ...), but `settings.scene` is the one exception. The shell's
+    scene fan-out (createSceneFanout in src/main.js) deliberately omits the
+    key while its content digest is unchanged: an embedded scene is
+    multi-megabyte and would otherwise cross the stdin pipe on every ~2 s
+    state push. Treating that omission as "no scene" made every scene edit
+    vanish from the panel one push (~2 s) after it landed -- the S2-T8a
+    regression. Omission therefore means "keep rendering the last scene
+    that validated here"; only an explicit null clears it.
+
+    The four rules (scoped to `settings.scene` alone):
+      1. key absent    -> retain `last`, injected back into settings; with
+                          no scene ever received, leave the state alone and
+                          the render path keeps today's lyrics view.
+      2. explicit null -> clear: nothing is retained any more.
+      3. invalid (validate_scene raises ProtocolError) -> CLEAR and warn
+                          (deduped via _warn_scene_fallback). Fail-safe
+                          direction: a scene we cannot validate is a scene
+                          we must not draw -- never keep rendering stale
+                          content, never latch on the failure.
+      4. valid         -> use it and remember it as the new `last`.
+
+    Pure by design: no module-global mutable state is read, and neither
+    argument is mutated (a new state dict is built when injecting or
+    clearing). main() keeps `last_scene` as a LOCAL beside `state` and calls
+    this where the queue is drained; drain and render share the loop thread,
+    so there is nothing to lock, and the step runs once per drained
+    envelope -- never on the per-frame path.
+    """
+    if not isinstance(state, dict):
+        return state, last
+    settings = state.get("settings")
+    # A non-dict `settings` has no scene key to interpret AND must not be
+    # rewritten: rebuilding it as {"scene": last} would silently REPLACE the
+    # malformed value (only when a scene was retained -- asymmetric with
+    # `last is None`, which left it alone), changing the input shape the
+    # downstream malformed-settings handling receives. Retention applies to
+    # dict settings only; malformed input stays exactly as received.
+    if not isinstance(settings, dict):
+        return state, last
+    scope = settings
+    if "scene" not in scope:
+        if last is None:
+            return state, last  # Rule 1, no scene ever received
+        return {**state, "settings": {**scope, "scene": last}}, last  # Rule 1
+    if scope["scene"] is None:
+        return state, None  # Rule 2: explicit null clears
+    try:
+        validated = validate_scene(scope["scene"])
+    except ProtocolError as exc:
+        _warn_scene_fallback(exc)
+        return {**state, "settings": {**scope, "scene": None}}, None  # Rule 3
+    # Rule 4: remember the VALIDATED copy, never the raw input.
+    return {**state, "settings": {**scope, "scene": validated}}, validated
+
+
 def _scene_from_state(state: Dict[str, Any]):
     """Validated scene from state.settings.scene, or None for "no scene".
 
-    None means "render the legacy view": the key is absent (no scene
-    configured) OR stored invalid -- a bad value in settings.json must
-    never crash the loop or blank the panel (fail back, then surface via
+    RETENTION LIVES UPSTREAM: main() resolves the shell's omitted-key case
+    in apply_scene_retention BEFORE the loop renders, so by the time this
+    runs an absent key means "nothing retained" (never configured, cleared
+    by an explicit null, or refused as invalid) -- not "the fan-out stripped
+    it this tick". Feeding a raw envelope here instead would re-open the
+    S2-T8a absent-equals-none bug; do not "simplify" retention away.
+
+    None means "render the legacy view": no retained scene OR a value that
+    fails validate_scene -- a bad value in settings.json must never crash
+    the loop or blank the panel (fail back, then surface via
     _warn_scene_fallback). Validation here is validate_scene itself: the
     sidecar never trusts the shell's gate (defense in depth, same rule the
     preview path applies to wire input).
@@ -2505,6 +2574,9 @@ def main(argv=None) -> int:
         f"{profile.buffer_size[0]}x{profile.buffer_size[1]}")
 
     state: Dict[str, Any] = {}
+    # Last VALIDATED scene received. Local to this loop thread (the reader
+    # thread only enqueues envelopes), so retention needs no lock.
+    last_scene: Optional[Dict[str, Any]] = None
     seq: Optional[int] = None
     fps = DEFAULT_FPS
     frames = 0
@@ -2516,7 +2588,12 @@ def main(argv=None) -> int:
             try:
                 while True:
                     new_seq, new_state = pending.get_nowait()
-                    state = new_state
+                    # `settings.scene` is the ONE retained field (see
+                    # apply_scene_retention): the shell omits the key while
+                    # its digest is unchanged, so replacing the state
+                    # wholesale here dropped the scene one push after every
+                    # edit. Every other field still comes from new_state.
+                    state, last_scene = apply_scene_retention(new_state, last_scene)
                     if new_seq is not None:
                         seq = new_seq
                     fps = fps_from_state(state)

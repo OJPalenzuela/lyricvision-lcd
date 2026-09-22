@@ -368,7 +368,9 @@ def test_undecodable_media_is_typed(tmp_path):
 # Unsupported vs invalid
 # --------------------------------------------------------------------------
 
-@pytest.mark.parametrize("kind", ["gif", "video"])
+# gif is implemented since S1-T5 (see tests/test_scene_gif.py); video stays
+# unsupported until S3-T12 and must be checked BEFORE the source is touched.
+@pytest.mark.parametrize("kind", ["video"])
 def test_unsupported_background_kind_is_typed(kind, tmp_path):
     with pytest.raises(lcd_bridge.SceneRenderError) as exc:
         render(image_bg("x.png", kind=kind), tmp_path)
@@ -407,15 +409,17 @@ def test_invalid_scene_raises_protocol_error_not_scene_error(tmp_path):
 
 # Expected render outcome per corpus-valid shape. Valid means "shape-valid",
 # not "renderable": the binding media policy refuses out-of-root sources
-# (C:/...), gif/video and gpu-temp are unimplemented here (S1-T5/S3-T12),
-# and the corpus' data URI is a deliberately truncated PNG. Anything else
-# (ProtocolError, OSError, unexpected exception) fails this test.
+# (C:/...), video and gpu-temp are unimplemented here (S3-T12), and the
+# corpus' data URIs are deliberately truncated: the PNG one fails decode,
+# and the gif one ("R0lGODlhAQABA", 13 chars) is invalid base64, so its
+# bytes never reach the GIF decoder. Anything else (ProtocolError, OSError,
+# unexpected exception) fails this test.
 CORPUS_VALID_OUTCOMES = {
     "default-scene": "render",
     "background-none": "unsupported_overlay",
     "background-color": "unsupported_overlay",
     "background-image": "media_refused",
-    "background-gif": "unsupported_background",
+    "background-gif": "media_unreadable",
     "background-video": "unsupported_background",
     "rotation-degrees": "media_missing",
     "color-mixed-case": "unsupported_overlay",

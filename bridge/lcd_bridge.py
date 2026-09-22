@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import io
 import json
 import math
@@ -902,6 +903,49 @@ SCENE_MAX_LAYER_DIM = 4096
 SCENE_MAX_IMAGE_DIM = 4096
 _TEXT_LAYER_PAD = 4
 
+# GIF pacing (S1-T5): Pillow stores per-frame delay in milliseconds. A
+# missing or zero delay must NEVER become a 0 ms interval -- that would
+# busy-loop the caller -- and 100 ms is the de-facto Pillow/browser floor
+# for "no delay given".
+GIF_DEFAULT_DELAY_MS = 100
+
+# GIF resource bounds (S1-T5), checked in this order BEFORE any pixel is
+# decoded: source bytes (stat before the read, in _load_media_bytes) ->
+# format -> per-side dimensions (header only) -> frame count (header scan;
+# every GIF frame costs >= ~25 bytes on disk, so the byte cap bounds that
+# scan too). 4096 per side also implies at most 4096*4096 = 16.7M decoded
+# pixels, below Pillow's MAX_IMAGE_PIXELS (89,478,485 on the pinned
+# 12.3.0), so an accepted file cannot reach the decompression-bomb limit;
+# DecompressionBombError is still mapped to media_too_large as defense in
+# depth.
+SCENE_MAX_GIF_BYTES = 16 * 1024 * 1024
+SCENE_MAX_GIF_FRAMES = 512
+SCENE_MAX_GIF_DIM = 4096
+
+# Refresh-policy sentinels (S1-T5, scene_refresh_ms below). FAIL-SAFE
+# INVARIANT: every value here is a finite positive integer -- never 0,
+# never negative, never infinity/NaN. 0 or negative would make the future
+# S1-T7 loop busy-spin; infinity or NaN would corrupt the now+wait
+# deadline arithmetic into an overflow or a non-deadline. The static case
+# genuinely needs no SCENE refresh, so its sentinel is LARGE (1 hour): if
+# the "static" verdict were ever wrong, the worst case is a FROZEN panel
+# -- the last rendered frame stays visible until the next real event. A
+# frozen panel is visible and reportable; a spin or an overflow is not.
+# SCOPE CAVEAT: this answers "when does the SCENE change", not "when do
+# PIXELS change". Production pixels also come from state (lyric line, the
+# progress clock that ticks every second) and from the GIF frame selector,
+# none of which the scene digest sees. Wiring this in WITHOUT composing it
+# with a state digest WOULD freeze live lyrics behind a static background,
+# so S1-T7 must key on scene_digest || display-state digest || frame_index
+# || a time bucket, never on this alone.
+REFRESH_STATIC_MS = 60 * 60 * 1000
+# gpu-temp overlay: sensor values move about once a second.
+REFRESH_SENSOR_MS = 1000
+# video: TODO(S3-T12) placeholder -- a ~30fps tick until real decode
+# exposes the container's per-frame timing. Finite and small on purpose:
+# a wired-in loop would degrade to frequent cheap checks, never to freeze.
+REFRESH_VIDEO_MS = 33
+
 
 class SceneRenderError(Exception):
     """Typed scene-rendering failure (S1-T4).
@@ -910,11 +954,12 @@ class SceneRenderError(Exception):
     malformed") and from OSError (filesystem: never allowed to leak from
     this renderer). ``reason`` is the greppable discriminator:
 
-      unsupported_background  valid kind, not implemented yet (gif/video)
+      unsupported_background  valid kind, not implemented yet (video; gif: S1-T5)
       unsupported_overlay     valid kind, not implemented yet (gpu-temp)
       media_refused           source resolves outside the media root
       media_missing           contained key is not a regular file
       media_unreadable        bytes would not decode as an image
+      media_too_large         source exceeds the GIF resource caps above
       text_too_long           text exceeds the caps above
     """
 
@@ -1002,10 +1047,25 @@ def _resolve_media_source(source: str, media_root: Any) -> str:
     return candidate
 
 
-def _load_media_bytes(source: str, media_root: Any) -> bytes:
-    """Inline data: URL bytes, or a contained read from the media root."""
+def _load_media_bytes(source: str, media_root: Any, *, max_bytes: Optional[int] = None) -> bytes:
+    """Inline data: URL bytes, or a contained read from the media root.
+
+    ``max_bytes`` (GIF payloads, S1-T5): for filesystem keys the cap is
+    enforced via stat() BEFORE the read, so a multi-gigabyte file is
+    refused without ever being pulled into memory; a data: URL is checked
+    on the decoded bytes (its size is already bounded by the scene JSON
+    that carries it).
+    """
     if source[:5].lower() == "data:":
-        return _decode_data_url(source)
+        data = _decode_data_url(source)
+        if max_bytes is not None and len(data) > max_bytes:
+            raise SceneRenderError(
+                "media_too_large",
+                f"media payload is {len(data)} bytes, over the {max_bytes} "
+                f"byte cap: {source[:64]!r}",
+                field="background.source",
+            )
+        return data
     path = _resolve_media_source(source, media_root)
     if not os.path.isfile(path):
         raise SceneRenderError(
@@ -1014,9 +1074,17 @@ def _load_media_bytes(source: str, media_root: Any) -> bytes:
             field="background.source",
         )
     try:
+        if max_bytes is not None and os.path.getsize(path) > max_bytes:
+            raise SceneRenderError(
+                "media_too_large",
+                f"media file exceeds the {max_bytes} byte cap: {source!r}",
+                field="background.source",
+            )
         with open(path, "rb") as handle:
             return handle.read()
     except OSError as exc:
+        # SceneRenderError is not an OSError, so the size refusal above
+        # passes through untouched; this arm is real I/O failure only.
         raise SceneRenderError(
             "media_unreadable",
             f"media key could not be read: {source!r}",
@@ -1041,9 +1109,19 @@ def _open_rgba(payload: bytes, source: str):
 
 
 def _render_image_background(canvas, bg: Dict[str, Any], media_root: Any) -> None:
-    w, h = canvas.size
     payload = _load_media_bytes(bg["source"], media_root)
     image = _open_rgba(payload, bg["source"])
+    _compose_image_background(canvas, image, bg)
+
+
+def _compose_image_background(canvas, image, bg: Dict[str, Any]) -> None:
+    """Shared transform pipeline for image-like backgrounds (image, GIF).
+
+    Split out at S1-T5 so a GIF frame and an image background are
+    GUARANTEED the identical transform set: the code below is verbatim
+    from the S1-T4 image path, and GIF frames enter at `image`.
+    """
+    w, h = canvas.size
     iw, ih = image.size
     # fit/fill is the viewport mode (letterbox vs cover-crop), then the
     # user's scale multiplies that base factor.
@@ -1145,7 +1223,7 @@ def _draw_text_overlay(canvas, overlay: Dict[str, Any], index: int) -> None:
     canvas.paste(Image.alpha_composite(canvas, plate))
 
 
-def render_scene(scene, *, media_root, size=(480, 854)):
+def render_scene(scene, *, media_root, size=(480, 854), frame_index: int = 0):
     """Render a scene to an RGBA image -- pure, side-effect free.
 
     Contract (S1-T4):
@@ -1157,8 +1235,16 @@ def render_scene(scene, *, media_root, size=(480, 854)):
       * `media_root` is the ONLY filesystem door: background.source is
         either a data: URL (decoded inline) or a key resolved and
         containment-checked inside media_root (_resolve_media_source).
-      * Background gif/video and gpu-temp overlays validate but are not
-        implemented until S1-T5/S3-T12: they raise
+      * `frame_index` selects a GIF frame DETERMINISTICALLY (default 0):
+        no clock, no counter -- same scene + same selector -> byte-identical
+        image. Past the last frame the selector WRAPS (GIFs loop by
+        nature; clamping would freeze the animation) and the modulo runs
+        before the frame walk, so a huge index costs one division, never
+        a billion seeks. Negative/non-int (including bool) -> ValueError.
+        The selected frame's DELAY is not returned here: callers read it
+        from scene_refresh_ms, which shares this selector.
+      * Background gif renders since S1-T5; video and gpu-temp overlays
+        still validate but are not implemented (S3-T12): they raise
         SceneRenderError("unsupported_*") so the caller can tell
         "unsupported" from "invalid" (ProtocolError from validate_scene).
       * ADDITIVE: not wired into the live frame loop (S1-T7, hardware).
@@ -1173,6 +1259,7 @@ def render_scene(scene, *, media_root, size=(480, 854)):
         )
     ):
         raise ValueError("size must be a (width, height) tuple of positive ints")
+    _validate_frame_index(frame_index)
     # Defense in depth: validation errors are ProtocolError, never
     # SceneRenderError -- the two families stay disjoint for callers.
     validated = validate_scene(scene)
@@ -1186,14 +1273,16 @@ def render_scene(scene, *, media_root, size=(480, 854)):
         canvas.paste(_hex_rgb(background["color"]) + (255,), (0, 0, w, h))
     elif kind == "image":
         _render_image_background(canvas, background, media_root)
+    elif kind == "gif":
+        _render_gif_background(canvas, background, media_root, frame_index)
     else:
-        # gif/video (and any kind the validator might add later): valid but
+        # video (and any kind the validator might add later): valid but
         # not implemented here. Checked BEFORE the source is touched, so an
         # unsupported kind never leaks a media error.
         raise SceneRenderError(
             "unsupported_background",
             f"background kind {kind!r} is not supported by render_scene yet "
-            "(gif/video: S1-T5 / S3-T12)",
+            "(video: S3-T12)",
             field="background.kind",
         )
     for index, overlay in enumerate(validated["overlays"]):
@@ -1210,6 +1299,252 @@ def render_scene(scene, *, media_root, size=(480, 854)):
                 field=f"overlays[{index}].kind",
             )
     return canvas
+
+
+def _validate_frame_index(frame_index: Any) -> int:
+    """Reject non-selector values before any GIF work starts.
+
+    bool is an int subclass (True == 1), but a flag is never a selector:
+    accepting it would silently render frame 1 for what reads as a toggle.
+    """
+    if isinstance(frame_index, bool) or not isinstance(frame_index, int):
+        raise ValueError("frame_index must be an integer >= 0")
+    if frame_index < 0:
+        raise ValueError("frame_index must be an integer >= 0")
+    return frame_index
+
+
+def _open_gif(payload: bytes, source: str):
+    """Open GIF bytes and enforce header-level bounds BEFORE any decode.
+
+    Order matters (each check costs less than the work it prevents):
+    format -> per-side dimensions (header only) -> frame count (header
+    scan; the source byte cap was already enforced in _load_media_bytes,
+    before this function was reached). Every failure closes the handle and
+    raises a typed SceneRenderError -- OSError must never leak.
+    """
+    try:
+        handle = Image.open(io.BytesIO(payload))
+    except Image.DecompressionBombError as exc:
+        # Crafted header whose pixel count exceeds Pillow's limit (the
+        # exception text carries the actual limit, 178956970 on the pinned
+        # 12.3.0): a SIZE problem by definition, so media_too_large.
+        raise SceneRenderError(
+            "media_too_large",
+            f"GIF exceeds Pillow's decompression-bomb limit: {exc}",
+            field="background.source",
+        ) from exc
+    except (OSError, ValueError, SyntaxError) as exc:
+        # UnidentifiedImageError is an OSError: not-a-GIF bytes are a data
+        # problem, never an internal fault.
+        raise SceneRenderError(
+            "media_unreadable",
+            f"media bytes are not a decodable GIF: {source!r} ({exc})",
+            field="background.source",
+        ) from exc
+    if handle.format != "GIF":
+        # e.g. PNG bytes stored under a .gif key: decodable as an image,
+        # but not a GIF -- and this path is GIF-specific (n_frames/seek/
+        # duration), so accepting it would silently misrender.
+        handle.close()
+        raise SceneRenderError(
+            "media_unreadable",
+            f"media bytes are not GIF data: {source!r}",
+            field="background.source",
+        )
+    width, height = handle.size
+    if max(width, height) > SCENE_MAX_GIF_DIM:
+        # Header-only check: fires before a single frame is decoded. It
+        # also keeps accepted files at <= 4096*4096 = 16.7M pixels, below
+        # Pillow's MAX_IMAGE_PIXELS (89,478,485), so an accepted GIF
+        # cannot reach the decompression-bomb limit during load.
+        handle.close()
+        raise SceneRenderError(
+            "media_too_large",
+            f"GIF dimensions {width}x{height} exceed the "
+            f"{SCENE_MAX_GIF_DIM}px per-side cap: {source!r}",
+            field="background.source",
+        )
+    try:
+        count = handle.n_frames  # header scan; bounded by the byte cap
+    except (OSError, ValueError) as exc:
+        handle.close()
+        raise SceneRenderError(
+            "media_unreadable",
+            f"GIF frame table could not be read: {source!r} ({exc})",
+            field="background.source",
+        ) from exc
+    if count > SCENE_MAX_GIF_FRAMES:
+        handle.close()
+        raise SceneRenderError(
+            "media_too_large",
+            f"GIF has {count} frames, over the {SCENE_MAX_GIF_FRAMES} cap: "
+            f"{source!r}",
+            field="background.source",
+        )
+    return handle, count
+
+
+def _gif_select(handle, count: int, frame_index: int, source: str) -> int:
+    """Seek to the WRAPPED selector and return the frame it lands on.
+
+    WRAP, not clamp: GIFs loop by nature -- clamping past the last frame
+    would freeze the animation. The modulo runs BEFORE the walk, so a huge
+    index costs one division instead of a billion seeks.
+    """
+    try:
+        index = frame_index % count
+        if index:
+            # Pillow composes frames 0..index during a forward seek (GIF
+            # disposal is applied inside the decoder), so the handle then
+            # exposes the FULL canvas at `index`, not the stored partial
+            # tile -- verified against the pinned 12.3.0 with
+            # delta-encoded fixtures in tests/test_scene_gif.py.
+            handle.seek(index)
+    except Image.DecompressionBombError as exc:
+        # Defense in depth: the dim cap above already implies a pixel count
+        # under the limit; if the caps ever drift, this stays typed.
+        raise SceneRenderError(
+            "media_too_large",
+            f"GIF frame decode exceeds Pillow's pixel limit: {exc}",
+            field="background.source",
+        ) from exc
+    except (OSError, ValueError) as exc:
+        raise SceneRenderError(
+            "media_unreadable",
+            f"GIF frame {frame_index} could not be decoded: {source!r} ({exc})",
+            field="background.source",
+        ) from exc
+    return index
+
+
+def _gif_delay(handle) -> int:
+    """The selected frame's delay in ms, floored to GIF_DEFAULT_DELAY_MS.
+
+    A missing or 0 delay must never become a 0 ms interval: that would
+    busy-loop the future S1-T7 caller. Pillow and browsers treat "no delay
+    given" as ~100 ms, so that is the documented floor.
+    """
+    delay = handle.info.get("duration")
+    if isinstance(delay, int) and delay > 0:
+        return delay
+    return GIF_DEFAULT_DELAY_MS
+
+
+def _gif_open_frame(source: str, media_root: Any, frame_index: int, *, rgba: bool):
+    """Select ONE frame of one GIF: shared by render and refresh policy.
+
+    A single selector implementation serves both callers so
+    `render_scene(frame_index=i)` and `scene_refresh_ms(frame_index=i)` can
+    never disagree about which frame -- or which delay -- a selector value
+    denotes. With rgba=False the frame's pixels are skipped (policy path
+    needs only the delay; the seek cost is shared and unavoidable).
+    """
+    payload = _load_media_bytes(source, media_root, max_bytes=SCENE_MAX_GIF_BYTES)
+    handle, count = _open_gif(payload, source)
+    try:
+        _gif_select(handle, count, frame_index, source)
+        delay = _gif_delay(handle)
+        image = None
+        if rgba:
+            try:
+                image = handle.convert("RGBA")
+            except Image.DecompressionBombError as exc:
+                raise SceneRenderError(
+                    "media_too_large",
+                    f"GIF frame exceeds Pillow's pixel limit: {exc}",
+                    field="background.source",
+                ) from exc
+            except (OSError, ValueError, SyntaxError) as exc:
+                raise SceneRenderError(
+                    "media_unreadable",
+                    f"GIF frame could not be decoded: {source!r} ({exc})",
+                    field="background.source",
+                ) from exc
+    finally:
+        handle.close()
+    return image, delay
+
+
+def _render_gif_background(
+    canvas, bg: Dict[str, Any], media_root: Any, frame_index: int
+) -> None:
+    """Draw frame `frame_index` of the GIF at bg["source"] (S1-T5).
+
+    Containment is unchanged (the same _load_media_bytes ->
+    _resolve_media_source door image backgrounds use), and the frame flows
+    through the SHARED _compose_image_background pipeline, so
+    flip/scale/rotate/pan behave identically for image and GIF.
+    """
+    image, _delay = _gif_open_frame(bg["source"], media_root, frame_index, rgba=True)
+    _compose_image_background(canvas, image, bg)
+
+
+# ---------------------------------------------------------------------------
+# scene_digest / scene_refresh_ms (S1-T5): dirty-flag machinery. Pure and
+# ADDITIVE -- the live loop still runs a blind 1/fps cadence; wiring this in
+# is S1-T7 together with physical-hardware validation.
+# INDEPENDENT-VERIFICATION FINDING (recorded here rather than hidden):
+# both functions are SCENE-ONLY. render_unified draws the lyric line, a
+# progress clock that ticks every second, title/artist/artwork and the
+# play icon -- all from state -- and an animating GIF's scene digest is
+# constant across frames. So these are a correct COMPONENT of a dirty key,
+# never the whole key: S1-T7 must compose scene_digest with a digest of
+# the display-relevant state subset, with frame_index, and with a time
+# bucket for progress extrapolation, and must prove it with a test where
+# the scene is static while lyric.current_line / progressMs change and the
+# panel still re-renders. Using either function alone freezes live lyrics.
+# ---------------------------------------------------------------------------
+
+
+def scene_digest(scene) -> str:
+    """Stable content hash of a VALIDATED scene -- the dirty-flag key.
+
+    * validate FIRST: hashing untrusted garbage would let an invalid scene
+      compare "unchanged" against another invalid scene; validation errors
+      stay ProtocolError (invalid input) while the return value stays a
+      digest string (valid input) -- two disjoint families, never a hash
+      of lies.
+    * sort_keys: JSON key insertion order must never dirty the panel.
+      validate_scene already rebuilds allowlisted keys in a fixed order;
+      sort_keys makes that guarantee explicit instead of incidental.
+    * List order (overlay sequence) is SIGNIFICANT: swapping two overlays
+      changes what must be drawn, so it must change the digest.
+    """
+    validated = validate_scene(scene)
+    canonical = json.dumps(validated, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def scene_refresh_ms(scene, *, media_root, frame_index: int = 0) -> int:
+    """Milliseconds until this scene must be re-rendered -- refresh policy.
+
+    Most urgent driver wins (the MINIMUM):
+      * gif background: the SELECTED frame's own delay, wrapped and floored
+        exactly like render_scene's selector (shared implementation).
+      * video background: REFRESH_VIDEO_MS -- a documented TODO placeholder
+        until S3-T12 exposes real per-frame timing.
+      * gpu-temp overlay: REFRESH_SENSOR_MS (sensor values move ~1 Hz).
+      * anything else (none/color/image + text overlays): REFRESH_STATIC_MS,
+        and the static verdict deliberately touches NO filesystem: an image
+        source need not exist to know it will not change on its own.
+    Invalid scene -> ProtocolError, same family as render_scene.
+    """
+    _validate_frame_index(frame_index)
+    validated = validate_scene(scene)
+    background = validated["background"]
+    kind = background["kind"]
+    if kind == "gif":
+        _image, wait = _gif_open_frame(
+            background["source"], media_root, frame_index, rgba=False
+        )
+    elif kind == "video":
+        wait = REFRESH_VIDEO_MS
+    else:  # none/color/image: no autonomous change source
+        wait = REFRESH_STATIC_MS
+    if any(overlay["kind"] == "gpu-temp" for overlay in validated["overlays"]):
+        wait = min(wait, REFRESH_SENSOR_MS)
+    return wait
 
 
 def portrait_to_buffer(portrait, rotation: str):

@@ -24,8 +24,9 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { execFile } = require('child_process');
-const { spawnBridge } = require('./bridge-spawn');
+const { spawnBridge, buildPreviewRequest } = require('./bridge-spawn');
 const hardening = require('./hardening');
+const { createPreviewCorrelator, previewError, PREVIEW_REASON } = require('./preview-correlator');
 
 // ---------------------------------------------------------------------------
 // Constants (locked LV-01/LV-02)
@@ -872,6 +873,11 @@ let lastBridgeStatus = null; // last {type:"status"} line
 let lastBridgeExit = null; // {code, signal}
 let pendingAcks = new Map(); // seq -> timestamp
 let exclusivityWarn = ''; // TRCC/SignalRGB detection message
+// S2-T8: preview reqId correlation shares the sidecar's stdout pipe with
+// acks/status (routing must consult it FIRST), and the fan-out remembers
+// the last scene digest pushed so unchanged scenes stop crossing the wire.
+const previewCorrelator = createPreviewCorrelator();
+const sceneFanout = createSceneFanout();
 
 // LV-06 watchdog: the sidecar emits status ~1Hz + ack per frame. While a
 // stream is expected, >5s without EITHER marks bridge-wedged and restarts
@@ -955,10 +961,57 @@ function buildBridgeEnvelope(seq, state) {
   return { v: 1, seq, cmd: 'state', state };
 }
 
+/**
+ * Order-insensitive content digest: JSON.stringify is key-order-sensitive,
+ * so sort keys recursively — {a,b} and {b,a} must digest identically.
+ */
+function stableSceneDigest(value) {
+  if (value === null || typeof value !== 'object') {
+    return value === undefined ? 'null' : JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map(stableSceneDigest).join(',')}]`;
+  const keys = Object.keys(value).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableSceneDigest(value[k])}`).join(',')}}`;
+}
+
+/**
+ * Scene fan-out (S2-T8): buildBridgeState re-validates the scene on every
+ * push, but resending an unchanged scene each poll is pure wire cost — the
+ * panel keeps rendering the last scene delivered until a new one arrives.
+ * `apply` strips settings.scene while its digest is unchanged; an ABSENT
+ * scene (invalid-scene fail-safe) resets the digest so a returning valid
+ * scene is re-sent, and `reset()` re-arms carrying after every (re)start
+ * because a fresh sidecar state starts empty.
+ */
+function createSceneFanout() {
+  let lastDigest = null;
+  return {
+    apply(state) {
+      const scene = state && state.settings ? state.settings.scene : undefined;
+      if (scene === undefined || scene === null) {
+        lastDigest = null;
+        return state;
+      }
+      const digest = stableSceneDigest(scene);
+      if (lastDigest !== null && digest === lastDigest) {
+        const settings = { ...state.settings };
+        delete settings.scene;
+        return { ...state, settings };
+      }
+      lastDigest = digest;
+      return state;
+    },
+    reset() {
+      lastDigest = null;
+    },
+  };
+}
+
 function sendStateToBridge() {
   if (!bridgeChild || bridgeChild.exitCode !== null) return;
   bridgeSeq += 1;
-  const envelope = buildBridgeEnvelope(bridgeSeq, buildBridgeState(lastPlayer, loadSettings()));
+  const state = sceneFanout.apply(buildBridgeState(lastPlayer, loadSettings()));
+  const envelope = buildBridgeEnvelope(bridgeSeq, state);
   pendingAcks.set(bridgeSeq, Date.now());
   const line = `${JSON.stringify(envelope)}\n`;
   try {
@@ -974,14 +1027,56 @@ function sendStateToBridge() {
   }
 }
 
+/**
+ * Scene preview over the LIVE sidecar pipe (S2-T8): validate first
+ * (buildPreviewRequest re-runs the hardening gate — an invalid scene never
+ * reaches the pipe), then register the reqId waiter BEFORE the write so a
+ * fast reply cannot arrive uncorrelated. No second process, no temp file:
+ * the preview exists only while this app holds the panel.
+ * @param {object} scene - untrusted renderer scene.
+ * @param {{exitCode:number|null, stdin?:{write:Function}}|null} child - current sidecar.
+ * @returns {Promise<string>} data: URL of the frame rendered by the engine.
+ */
+function handlePreviewRequest(scene, child) {
+  const built = buildPreviewRequest(scene);
+  if (!built.ok) {
+    return Promise.reject(
+      previewError(PREVIEW_REASON.INVALID_SCENE, `${built.field}: ${built.error}`)
+    );
+  }
+  if (!child || child.exitCode !== null) {
+    return Promise.reject(previewError(PREVIEW_REASON.SIDECAR_ABSENT, 'no live sidecar'));
+  }
+  const reply = previewCorrelator.wait(built.reqId);
+  try {
+    if (!child.stdin || typeof child.stdin.write !== 'function') {
+      throw new Error('bridge child stdin is not writable');
+    }
+    child.stdin.write(built.line); // false = backpressure, not failure
+  } catch (err) {
+    previewCorrelator.settleError(
+      built.reqId,
+      previewError(PREVIEW_REASON.WRITE_FAILED, String((err && err.message) || err))
+    );
+  }
+  return reply;
+}
+
 function handleBridgeLine(line) {
   let msg;
   try {
     msg = JSON.parse(line);
   } catch {
-    return; // ignore non-JSON stdout
+    return undefined; // ignore non-JSON stdout
   }
-  if (!msg || typeof msg !== 'object') return;
+  if (!msg || typeof msg !== 'object') return undefined;
+  // S2-T8 routing: preview_response shares stdout with acks/status, so the
+  // correlation seam is consulted FIRST — a preview reply (matched or not)
+  // is claimed here and never falls through to the ack/status path.
+  if (msg.cmd === 'preview_response') {
+    previewCorrelator.handleLine(line);
+    return 'preview';
+  }
   if (msg.type === 'ack' && typeof msg.seq === 'number') {
     bridgeWatchdog.heartbeat();
     pendingAcks.delete(msg.seq);
@@ -989,12 +1084,16 @@ function handleBridgeLine(line) {
     for (const seq of [...pendingAcks.keys()]) {
       if (seq < msg.seq) pendingAcks.delete(seq);
     }
-  } else if (msg.type === 'status') {
+    return 'ack';
+  }
+  if (msg.type === 'status') {
     bridgeWatchdog.heartbeat();
     lastBridgeStatus = msg;
     updateLcdStatus();
     pushPlayerState(); // keep the status grid fresh (~1 Hz is fine)
+    return 'status';
   }
+  return undefined;
 }
 
 function startBridge() {
@@ -1005,6 +1104,7 @@ function startBridge() {
   bridgeChild = child;
   bridgeWatchdog.setExpecting(true);
   bridgeWatchdog.heartbeat(); // fresh baseline: the sidecar talks ~1Hz from boot
+  sceneFanout.reset(); // fresh sidecar state: the next push must carry the scene
   log(`bridge spawned (${child.__bridgeSource}): ${redact(child.spawnfile)} ${(child.spawnargs || []).join(' ')}`);
 
   let stdoutBuf = '';
@@ -1024,6 +1124,7 @@ function startBridge() {
     logError('bridge spawn error:', redact(String((err && err.message) || err)));
     lastBridgeExit = { code: null, signal: null, spawnError: String((err && err.message) || err) };
     bridgeChild = null;
+    previewCorrelator.rejectAll(previewError(PREVIEW_REASON.EXITED, 'sidecar spawn error'));
     bridgeWatchdog.setExpecting(false);
     updateLcdStatus();
     scheduleBridgeRestart(false);
@@ -1032,6 +1133,7 @@ function startBridge() {
     log(`bridge exited (code=${code} signal=${signal || 'none'})`);
     lastBridgeExit = { code, signal };
     bridgeChild = null;
+    previewCorrelator.rejectAll(previewError(PREVIEW_REASON.EXITED, `sidecar exited (code=${code})`));
     const wasWedged = bridgeWatchdog.isWedged();
     bridgeWatchdog.setExpecting(false);
     for (const seq of [...pendingAcks.keys()]) pendingAcks.delete(seq);
@@ -1420,6 +1522,10 @@ function registerIpc() {
     return { settings: next, rejected };
   });
 
+  // S2-T8: the live preview rides the SAME sidecar; handlePreviewRequest
+  // re-validates the scene before a byte reaches the pipe.
+  ipcMain.handle('scene:preview', (_event, scene) => handlePreviewRequest(scene, bridgeChild));
+
   ipcMain.handle('spotify:connect', async (_event, args) => {
     const clientId = args && typeof args.clientId === 'string' ? args.clientId.trim() : '';
     if (clientId) persistSettings({ ...loadSettings(), spotifyClientId: clientId });
@@ -1554,6 +1660,7 @@ module.exports = {
   computeLcdStatus,
   bridgeStatusLine,
   handleBridgeLine,
+  handlePreviewRequest,
   getLcdStatus,
   buildDiagnosticsPayload,
   diagnosticsFilePath,
@@ -1562,6 +1669,7 @@ module.exports = {
   createWindow,
   startBridge,
   sendStateToBridge,
+  createSceneFanout,
   pollNow,
   bridgeWatchdog,
 };

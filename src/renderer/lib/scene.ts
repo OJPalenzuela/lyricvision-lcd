@@ -30,6 +30,14 @@ export const SCENE_VERSION = 1;
  */
 export const SCENE_OVERLAYS_CAP = 32;
 
+/**
+ * Cap on one text overlay's `text`, in characters. Mirrors
+ * SCENE_MAX_TEXT_CHARS in bridge/lcd_bridge.py and bridge/protocol.py; the
+ * cross-language pin in tests/renderer/text-length-gate.test.ts fails if any
+ * of the copies drifts apart.
+ */
+export const SCENE_MAX_TEXT_CHARS = 4096;
+
 export type BackgroundFit = 'fit' | 'fill';
 
 /** Render transform for media backgrounds, applied in glass space. */
@@ -302,8 +310,14 @@ export function isOverlay(value: unknown): value is Overlay {
   if (!isOverlayKind(kind)) return false;
   if (firstUnknownKey(value, overlayKeys(kind)) !== null) return false;
   switch (kind) {
-    case 'text':
-      return typeof value['text'] === 'string' && isPlacementFields(value);
+    case 'text': {
+      const text = value['text'];
+      return (
+        typeof text === 'string' &&
+        text.length <= SCENE_MAX_TEXT_CHARS &&
+        isPlacementFields(value)
+      );
+    }
     case 'gpu-temp':
       return isPlacementFields(value);
     default:

@@ -17,7 +17,9 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bridge import lcd_bridge  # noqa: E402
+from bridge import protocol  # noqa: E402
 from bridge.protocol import (  # noqa: E402
+    PREVIEW_ERROR_REASONS,
     PREVIEW_MAX_HEIGHT,
     PREVIEW_MAX_WIDTH,
     PROTOCOL_VERSION,
@@ -312,3 +314,42 @@ def test_scene_corpus_lockstep_with_hardening() -> None:
             if entry["expect"] != "valid":
                 mismatches.append(f"{name}: accepted but corpus says invalid field={entry.get('field')!r}")
     assert mismatches == [], mismatches
+
+
+# --------------------------------------------------------------------------
+# Overlay text length gate (S2-T8c): validation-time, typed reason
+# --------------------------------------------------------------------------
+
+def scene_with_text(text):
+    scene = valid_scene()
+    scene["overlays"][0]["text"] = text
+    return scene
+
+
+def test_validate_scene_accepts_text_at_the_cap():
+    """Exactly SCENE_MAX_TEXT_CHARS characters is still valid input."""
+    validate_scene(scene_with_text("a" * protocol.SCENE_MAX_TEXT_CHARS))
+
+
+def test_validate_scene_rejects_text_over_the_cap_with_typed_reason():
+    """Cap+1 must fail at VALIDATION time with the existing typed reason,
+    before any renderer can see it (defence in depth on top of the render
+    raise in lcd_bridge._draw_text_overlay)."""
+    over = "a" * (protocol.SCENE_MAX_TEXT_CHARS + 1)
+    try:
+        validate_scene(scene_with_text(over))
+    except ProtocolError as exc:
+        assert exc.reason == "text_too_long", exc.reason
+        assert exc.field == "overlays[0].text", exc.field
+    else:
+        raise AssertionError("expected validate_scene to reject over-long text")
+
+
+def test_text_too_long_stays_in_the_closed_reason_vocabulary():
+    # No NEW reason was invented for the validation-time gate.
+    assert "text_too_long" in PREVIEW_ERROR_REASONS
+
+
+def test_protocol_text_cap_equals_the_render_cap():
+    assert protocol.SCENE_MAX_TEXT_CHARS == lcd_bridge.SCENE_MAX_TEXT_CHARS
+    assert protocol.SCENE_MAX_TEXT_CHARS == 4096

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Pause, Play } from "lucide-react";
 
+import SceneEditor from "@/components/SceneEditor";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -27,6 +28,7 @@ import {
   type PlayerStatePush,
   type SpotifyState,
 } from "@/lib/bridge";
+import { DEFAULT_SCENE, type Scene } from "@/lib/scene";
 
 function statusBadgeVariant(status: string | undefined) {
   switch (status) {
@@ -51,6 +53,12 @@ export default function App() {
   const [syncOffsetSec, setSyncOffsetSec] = useState(0);
   const [serial, setSerial] = useState("");
   const [runAtStartup, setRunAtStartup] = useState(false);
+
+  // Scene editor (S2-T8): the scene is APP-level state — it survives the
+  // editor closing and feeds Save/Reset; editor-only UI state stays local.
+  const [scene, setScene] = useState<Scene>(DEFAULT_SCENE);
+  const [savedScene, setSavedScene] = useState<Scene>(DEFAULT_SCENE);
+  const [sceneOpen, setSceneOpen] = useState(false);
 
   // Live snapshots pushed by the main process.
   const [player, setPlayer] = useState<PlayerSnapshot | null>(null);
@@ -107,6 +115,10 @@ export default function App() {
     setExclusivityText(exclusivityTextOf(exclusivityWarn));
   }, []);
 
+  // Reset reverts to the last PERSISTED scene (boot load or a successful save).
+  const restoreScene = useCallback(() => setScene(savedScene), [savedScene]);
+  const handleSceneSaved = useCallback((next: Scene) => setSavedScene(next), []);
+
   useEffect(() => {
     const api = window.lyricvision;
     if (!api) {
@@ -131,6 +143,9 @@ export default function App() {
         setSyncOffsetSec(offsetMs / 1000);
         setSerial(settings.serial || "");
         setRunAtStartup(settings.runAtStartup === true);
+        const bootScene = settings.scene ?? DEFAULT_SCENE;
+        setScene(bootScene);
+        setSavedScene(bootScene);
         applySnapshot({
           player: null,
           spotify: initialSpotify,
@@ -442,6 +457,36 @@ export default function App() {
             <p id="settings-state" role="status" className="text-sm text-muted-foreground">
               {settingsState || " "}
             </p>
+          </CardContent>
+        </Card>
+      </section>
+
+      {/* Scene editor (S2-T8): live WYSIWYG preview over the sidecar pipe. */}
+      <section aria-label="Scene" className="mt-4">
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">Scene</CardTitle>
+            <CardDescription>
+              Background and overlay layout painted on the panel, with a live
+              preview on the connected display.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <Button
+              type="button"
+              aria-expanded={sceneOpen}
+              onClick={() => setSceneOpen((open) => !open)}
+            >
+              Scene editor
+            </Button>
+            {sceneOpen && (
+              <SceneEditor
+                scene={scene}
+                onSceneChange={setScene}
+                onReset={restoreScene}
+                onSaved={handleSceneSaved}
+              />
+            )}
           </CardContent>
         </Card>
       </section>

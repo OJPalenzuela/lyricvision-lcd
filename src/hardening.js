@@ -200,6 +200,13 @@ const DEFAULT_SCENE = { version: 1, background: { kind: 'none' }, overlays: [] }
 const SCENE_KEYS = ['version', 'background', 'overlays'];
 const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
 
+// Mirror of SCENE_MAX_TEXT_CHARS in bridge/lcd_bridge.py (render cap) and
+// bridge/protocol.py (validation cap). The literal necessarily repeats here
+// (this CommonJS gate cannot import a TS module); the duplication is pinned
+// equal by tests/renderer/text-length-gate.test.ts, which reads the constant
+// straight out of lcd_bridge.py.
+const SCENE_MAX_TEXT_CHARS = 4096;
+
 function sceneReject(field, error) {
   return { ok: false, field, error };
 }
@@ -344,6 +351,9 @@ function validateSceneOverlay(value, index) {
   if (value.kind === 'text' && typeof value.text !== 'string') {
     return sceneReject(`${at}.text`, 'text must be a string');
   }
+  if (value.kind === 'text' && value.text.length > SCENE_MAX_TEXT_CHARS) {
+    return sceneReject(`${at}.text`, `text exceeds ${SCENE_MAX_TEXT_CHARS} characters`);
+  }
   if (!isUnitFraction(value.x)) return sceneReject(`${at}.x`, 'x must be a fraction in [0,1]');
   if (!isUnitFraction(value.y)) return sceneReject(`${at}.y`, 'y must be a fraction in [0,1]');
   if (!isUnitFraction(value.size)) return sceneReject(`${at}.size`, 'size must be a fraction in [0,1]');
@@ -431,6 +441,7 @@ module.exports = {
   // Scene gate (S0-T1): validator + shared constants for the settings `scene`
   // key. DEFAULT_SCENE/SCENE_OVERLAYS_CAP mirror src/renderer/lib/scene.ts.
   validateScene,
+  SCENE_MAX_TEXT_CHARS,
   DEFAULT_SCENE,
   SCENE_OVERLAYS_CAP,
 };

@@ -42,11 +42,13 @@ from bridge.protocol import (  # noqa: E402
     CMD_PREVIEW_REQUEST,
     HEADER_SIZE,
     MAGIC,
+    PREVIEW_MAX_BASE64_CHARS,
     PREVIEW_UNAVAILABLE_MESSAGE,
     PROTOCOL_VERSION,
     ProtocolError,
     build_frame_header,
     build_preview_error,
+    build_preview_response,
     build_protocol_error,
     iter_chunks,
     parse_handshake,
@@ -333,6 +335,97 @@ def parse_state_line(line: str) -> Tuple[Optional[int], Optional[Dict[str, Any]]
     return seq, state
 
 
+# --------------------------------------------------------------------------
+# Preview rendering (S1-T6): a valid preview_request is answered with a real
+# base64 PNG rendered by the SAME render_scene() the panel will use (S1-T7).
+#
+# media_root provenance -- containment depends on it. The sidecar is spawned
+# by src/bridge-spawn.js resolveBridgeCommand, which passes ONLY --serial /
+# --once argv (src/bridge-spawn.js:49-78) and stdio (src/bridge-spawn.js:
+# 85-90): no cwd, no env override; and NO media-root key exists on the wire
+# (bridge/protocol.py PREVIEW_REQUEST_KEYS pins the envelope keys). This
+# module reads no environment variable either. So the ONE trusted anchor for
+# the containment root is this file's own location: bridge-spawn.js
+# repoRoot()/bridgeScript() (src/bridge-spawn.js:18-24) anchor the bridge at
+# <repo>/bridge/*.py exactly the way __file__ does here. The wire can
+# therefore never move the root: background.source is only ever resolved
+# INSIDE this fixed directory (or is a data: URL, no filesystem at all), so
+# _resolve_media_source keeps its containment meaning on this new call path.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MEDIA_ROOT = os.path.join(REPO_ROOT, "media")
+
+PREVIEW_MEDIA_TYPE = "image/png"
+
+
+def preview_size(max_width: int, max_height: int) -> Tuple[int, int]:
+    """Aspect-preserving preview size inside the request's hint box.
+
+    Scene coordinates are normalized 0-1 fractions of the canvas, which is
+    EXACTLY why the same scene renders correctly at any size: 240x427 is
+    the same code path as 480x854 with smaller pixel math -- never a second
+    renderer, never a post-hoc downscale. This helper only has to keep the
+    glass aspect (480:854) inside the caller's caps, so (240, 427) -- an
+    exact half of the glass -- is WYSIWYG with what the panel shows
+    (tests/test_preview_render.py proves it against the full-size render).
+    """
+    glass_w, glass_h = DEFAULT_GLASS
+    scale = min(max_width / glass_w, max_height / glass_h)
+    width = max(1, min(max_width, round(glass_w * scale)))
+    height = max(1, min(max_height, round(glass_h * scale)))
+    return width, height
+
+
+def _render_preview_response(request: Dict[str, Any]) -> Dict[str, Any]:
+    """Render a VALIDATED preview_request into its preview_response envelope.
+
+    Total by contract (route_stdin_line must never raise): containment
+    refusals, unsupported kinds, decode failures, the payload cap and even
+    an unexpected exception become typed error envelopes with a greppable
+    reason. A traceback over stdout would be parsed as JSONL noise and
+    silently dropped, leaving the shell waiting on a reply never sent.
+    """
+    req_id = request["reqId"]
+    if Image is None:
+        # The one genuinely unrenderable condition left after S1-T6: the
+        # Pillow renderer binary itself is absent. The happy path renders.
+        return build_preview_error(req_id, "preview_unavailable", PREVIEW_UNAVAILABLE_MESSAGE)
+    size = preview_size(request["maxWidth"], request["maxHeight"])
+    try:
+        # frame_index: the envelope carries NO frame selector
+        # (bridge/protocol.py PREVIEW_REQUEST_KEYS pins the keys), so the
+        # documented default is 0 -- render_scene's own default, i.e. the
+        # first GIF frame: a deterministic still (same request -> identical
+        # response), which is what a static preview must show.
+        canvas = render_scene(
+            request["scene"], media_root=MEDIA_ROOT, size=size, frame_index=0
+        )
+        buffer = io.BytesIO()
+        canvas.save(buffer, format="PNG")
+        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    except SceneRenderError as exc:
+        # Typed renderer failure: reason/field pass through verbatim so the
+        # shell sees the same discriminator the renderer itself uses.
+        return build_preview_error(req_id, exc.reason, exc.message, exc.field)
+    except ProtocolError as exc:
+        # render_scene re-validates as defense in depth; unreachable via
+        # route_stdin_line (validation already ran) but still typed.
+        return build_preview_error(req_id, exc.reason, exc.message, exc.field)
+    except Exception as exc:  # total contract: no traceback may escape
+        return build_preview_error(req_id, "render_failed", f"preview render failed: {exc}")
+    if len(encoded) > PREVIEW_MAX_BASE64_CHARS:
+        # Payload cap BEFORE emit: the preview shares the JSONL pipe with
+        # playback state, so an over-cap line is refused as a typed error
+        # instead of flooding the pipe (the cap is read from this module's
+        # namespace at call time; tests pin both directions).
+        return build_preview_error(
+            req_id,
+            "payload_too_large",
+            f"encoded preview is {len(encoded)} base64 chars, over the "
+            f"{PREVIEW_MAX_BASE64_CHARS} char cap",
+        )
+    return build_preview_response(req_id, encoded, PREVIEW_MEDIA_TYPE, size[0], size[1])
+
+
 def route_stdin_line(line: str) -> Optional[Tuple[str, Any, Any]]:
     """Route one stdin JSONL line (S0-T2).
 
@@ -367,15 +460,12 @@ def route_stdin_line(line: str) -> Optional[Tuple[str, Any, Any]]:
             else None
         )
         try:
-            validate_preview_request(payload)
+            request = validate_preview_request(payload)
         except ProtocolError as exc:
             return ("reply", build_preview_error(req_id, exc.reason, exc.message, exc.field))
-        # No renderer until S1-T6: answer explicitly with a greppable typed
-        # error instead of rendering anything or silently ignoring the line.
-        return (
-            "reply",
-            build_preview_error(req_id, "preview_unavailable", PREVIEW_UNAVAILABLE_MESSAGE),
-        )
+        # S1-T6: a valid request renders to a real reduced-resolution PNG
+        # through the SAME render_scene() the panel will use (S1-T7).
+        return ("reply", _render_preview_response(request))
     version = payload.get("v")
     if "v" in payload and (isinstance(version, bool) or version != PROTOCOL_VERSION):
         return (

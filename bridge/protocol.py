@@ -113,28 +113,54 @@ CMD_ERROR = "error"
 
 # Reduced-resolution cap on purpose: the base64 image crosses the SAME JSONL
 # pipe that carries playback state every 2s while playing (15s idle), and a
-# full 480x854 JPEG would push those state lines behind a multi-hundred-KB
-# blob. Half-scale of the portrait glass => a quarter of the pixels, which
-# keeps one preview line in the tens of KB. S1-T6's renderer must honor this.
+# full 480x854 image would push those state lines behind a multi-hundred-KB
+# blob. Half-scale of the portrait glass => a quarter of the pixels. S1-T6
+# renders through render_scene at exactly this cap (lcd_bridge.preview_size).
 PREVIEW_MAX_WIDTH = 480 // 2  # 240
 PREVIEW_MAX_HEIGHT = 854 // 2  # 427
+
+# S1-T6 payload cap: one preview_response crosses the same JSONL pipe as
+# playback state, so the ENCODED image is bounded BEFORE it is emitted --
+# never an unbounded line, never a pipe flood, always a typed refusal.
+# 512 KiB of base64 (~384 KiB PNG) sits an order of magnitude above every
+# realistic 240x427 render (measured on the pinned Pillow 12.3.0: color +
+# text 4.3 KB, structured image scene 44.7 KB) while still refusing a
+# crafted incompressible payload (240x427 RGBA noise = 547,488 base64
+# chars) with reason "payload_too_large" instead of writing it out.
+PREVIEW_MAX_BASE64_CHARS = 512 * 1024  # 524,288
 
 PREVIEW_MEDIA_TYPES = ("image/jpeg", "image/png")
 
 # Closed vocabulary for typed errors: a preview_response carries either an
-# image or an error.reason from this tuple — never both, never neither.
+# image or an error.reason from this tuple -- never both, never neither.
+# S1-T6 adds the renderer's typed SceneRenderError reasons (a preview
+# failure keeps the SAME greppable discriminator the renderer uses) plus
+# the payload cap; "preview_unavailable" leaves the happy path and remains
+# only as the missing-Pillow fallback below. src/bridge-spawn.js mirrors
+# this list exactly and both suites pin it, so drift fails a test.
 PREVIEW_ERROR_REASONS = (
     "invalid_request",
     "preview_unavailable",
     "render_failed",
     "version_mismatch",
     "unknown_cmd",
+    "payload_too_large",
+    "unsupported_background",
+    "unsupported_overlay",
+    "media_refused",
+    "media_missing",
+    "media_unreadable",
+    "media_too_large",
+    "text_too_long",
 )
 
-# Greppable placeholder until S1-T6 lands the renderer: a valid
-# preview_request is answered with reason "preview_unavailable" instead of
-# rendering anything or being silently ignored.
-PREVIEW_UNAVAILABLE_MESSAGE = "preview renderer not available yet (S1-T6)"
+# Fallback message for the ONE genuinely unrenderable condition left after
+# S1-T6: the Pillow renderer binary is absent. A valid, renderable scene
+# never produces this reason anymore -- it renders.
+PREVIEW_UNAVAILABLE_MESSAGE = (
+    "preview renderer unavailable: Pillow is not installed "
+    "(pip install -r bridge/requirements.txt)"
+)
 
 # Scene model constants mirrored from src/hardening.js (SCENE_VERSION,
 # SCENE_OVERLAYS_CAP). See validate_scene for the lockstep contract.

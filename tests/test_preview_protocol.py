@@ -3,11 +3,13 @@
 Run from the repo root:
     .venv/Scripts/python.exe -m pytest tests/test_preview_protocol.py -v
 
-Hardware-free: no USB, no network. The sidecar never renders here — until
-S1-T6 every valid preview_request must be answered with the typed
-``preview_unavailable`` error instead of an image or a silent drop.
+Hardware-free: no USB, no network. Envelope validation and routing live
+here; since S1-T6 a valid preview_request is answered with a rendered
+base64 PNG — the rendering behavior itself is covered by
+tests/test_preview_render.py.
 """
 
+import base64
 import json
 import os
 import sys
@@ -40,16 +42,9 @@ class _OverlaysWithProps(list):
 def valid_scene():
     return {
         "version": 1,
-        "background": {
-            "kind": "image",
-            "source": "bg.png",
-            "rotation": 0,
-            "flipH": False,
-            "scale": 1,
-            "panX": 0,
-            "panY": 0,
-            "fit": "fit",
-        },
+        # Color background since S1-T6: a valid request is now RENDERED, so
+        # the default scene must not depend on any staged media file.
+        "background": {"kind": "color", "color": "#102030"},
         "overlays": [
             {"kind": "text", "text": "hi", "x": 0.5, "y": 0.5, "size": 0.1,
              "rotation": 0, "color": "#ffffff"}
@@ -222,16 +217,21 @@ def test_malformed_state_envelope_answered() -> None:
     assert routed[1]["error"]["reason"] == "invalid_request", routed
 
 
-def test_preview_unavailable_typed_error() -> None:
+def test_valid_request_is_answered_with_a_rendered_png() -> None:
+    # S1-T6: the preview_unavailable placeholder left the happy path — a
+    # valid request now answers with a real rendered PNG at the cap size.
     routed = lcd_bridge.route_stdin_line(json.dumps(request_envelope()))
     assert routed is not None and routed[0] == "reply", routed
     response = routed[1]
     assert response["v"] == PROTOCOL_VERSION, response
     assert response["cmd"] == "preview_response", response
     assert response["reqId"] == 7, response
-    assert response["error"]["reason"] == "preview_unavailable", response
-    assert "S1-T6" in response["error"]["message"], response
-    assert "image" not in response, response
+    assert "error" not in response, response
+    assert response["mediaType"] == "image/png", response
+    assert response["width"] == PREVIEW_MAX_WIDTH, response
+    assert response["height"] == PREVIEW_MAX_HEIGHT, response
+    png = base64.b64decode(response["image"])
+    assert png.startswith(b"\x89PNG\r\n\x1a\n"), png[:16]
 
 
 def test_invalid_scene_answered_with_field() -> None:

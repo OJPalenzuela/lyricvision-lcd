@@ -110,12 +110,23 @@ const PREVIEW_MAX_HEIGHT = Math.floor(854 / 2); // 427
 const PREVIEW_MEDIA_TYPES = ['image/jpeg', 'image/png'];
 
 // Closed vocabulary mirrored from bridge/protocol.py PREVIEW_ERROR_REASONS.
+// S1-T6 adds the payload cap plus every typed SceneRenderError reason, so
+// the shell parses every preview error the sidecar can legally emit; both
+// suites pin the exact list, so drift fails a test.
 const PREVIEW_ERROR_REASONS = [
   'invalid_request',
   'preview_unavailable',
   'render_failed',
   'version_mismatch',
   'unknown_cmd',
+  'payload_too_large',
+  'unsupported_background',
+  'unsupported_overlay',
+  'media_refused',
+  'media_missing',
+  'media_unreadable',
+  'media_too_large',
+  'text_too_long',
 ];
 
 const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;

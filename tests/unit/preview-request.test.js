@@ -87,6 +87,27 @@ describe('buildPreviewRequest (S0-T2 envelope)', () => {
     expect(PREVIEW_ERROR_REASONS).toContain('invalid_request');
   });
 
+  it('error vocabulary stays pinned in lockstep with bridge/protocol.py', () => {
+    // S1-T6: the renderer can now answer, so the vocabulary gains the
+    // payload cap plus every typed SceneRenderError reason. Exact list:
+    // drift against protocol.py PREVIEW_ERROR_REASONS fails one suite.
+    expect(PREVIEW_ERROR_REASONS).toEqual([
+      'invalid_request',
+      'preview_unavailable',
+      'render_failed',
+      'version_mismatch',
+      'unknown_cmd',
+      'payload_too_large',
+      'unsupported_background',
+      'unsupported_overlay',
+      'media_refused',
+      'media_missing',
+      'media_unreadable',
+      'media_too_large',
+      'text_too_long',
+    ]);
+  });
+
   it('rejects a malformed scene with the exact field validateScene reports', () => {
     const bad = [
       [scene({ overlays: [textOverlay({ x: 1.5 })] }), 'overlays[0].x'],
@@ -193,6 +214,30 @@ describe('parsePreviewResponse correlation (S0-T2)', () => {
     expect(parsed.reqId).toBe(3);
     expect(parsed.error.reason).toBe('preview_unavailable');
     expect(parsed.image).toBeUndefined();
+  });
+
+  it('parses the S1-T6 renderer error reasons as typed errors', () => {
+    // The sidecar can now emit renderer-side reasons (payload cap,
+    // containment, unsupported kinds); the shell must accept them as
+    // typed errors, not reject them as unknown vocabulary.
+    for (const reason of [
+      'payload_too_large',
+      'media_refused',
+      'unsupported_background',
+      'media_missing',
+    ]) {
+      const line = JSON.stringify({
+        v: 1,
+        cmd: 'preview_response',
+        reqId: 3,
+        error: { reason, message: `typed: ${reason}` },
+      });
+      expect(parsePreviewResponse(line, 3)).toEqual({
+        ok: true,
+        reqId: 3,
+        error: { reason, message: `typed: ${reason}` },
+      });
+    }
   });
 
   it('rejects a response correlated to a different request', () => {

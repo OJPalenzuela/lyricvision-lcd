@@ -36,11 +36,19 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bridge.protocol import (  # noqa: E402
     CMD_FRAME,
+    CMD_PREVIEW_REQUEST,
     HEADER_SIZE,
     MAGIC,
+    PREVIEW_UNAVAILABLE_MESSAGE,
+    PROTOCOL_VERSION,
+    ProtocolError,
     build_frame_header,
+    build_preview_error,
+    build_protocol_error,
     iter_chunks,
     parse_handshake,
+    parse_json_object,
+    validate_preview_request,
 )
 from panels.registry import PanelProfile, lookup  # noqa: E402
 
@@ -319,6 +327,68 @@ def parse_state_line(line: str) -> Tuple[Optional[int], Optional[Dict[str, Any]]
         if seq is None:
             return None, None
     return seq, state
+
+
+def route_stdin_line(line: str) -> Optional[Tuple[str, Any, Any]]:
+    """Route one stdin JSONL line (S0-T2).
+
+    Returns:
+      ("state", seq, state) -- a state envelope (versioned, legacy or bare)
+          destined for the render queue: unchanged shipped pairing;
+      ("reply", envelope)   -- a message that must be ANSWERED: a
+          preview_response for a valid, invalid or wrong-version
+          preview_request, or a typed cmd:"error" envelope for an unknown
+          message type or an unusable state envelope;
+      None -- blank/non-JSON/non-object transport noise, tolerated exactly as
+          before (parse_state_line keeps its historical contract).
+
+    Total by contract: never raises. An exception here would kill the stdin
+    reader thread and leave the shell waiting on a sidecar that stopped
+    taking state — a rejected message must become a reply, never a crash.
+    """
+    seq, state = parse_state_line(line)
+    if state is not None:
+        return ("state", seq, state)
+    payload = parse_json_object(line)
+    if payload is None:
+        return None
+    cmd = payload.get("cmd")
+    if cmd == CMD_PREVIEW_REQUEST:
+        # Correlation id is read defensively so even a malformed request gets
+        # an answer the shell can (or cannot) match back to its queue.
+        raw_req_id = payload.get("reqId")
+        req_id: Optional[int] = (
+            raw_req_id
+            if isinstance(raw_req_id, int) and not isinstance(raw_req_id, bool)
+            else None
+        )
+        try:
+            validate_preview_request(payload)
+        except ProtocolError as exc:
+            return ("reply", build_preview_error(req_id, exc.reason, exc.message, exc.field))
+        # No renderer until S1-T6: answer explicitly with a greppable typed
+        # error instead of rendering anything or silently ignoring the line.
+        return (
+            "reply",
+            build_preview_error(req_id, "preview_unavailable", PREVIEW_UNAVAILABLE_MESSAGE),
+        )
+    version = payload.get("v")
+    if "v" in payload and (isinstance(version, bool) or version != PROTOCOL_VERSION):
+        return (
+            "reply",
+            build_protocol_error(
+                "version_mismatch",
+                f"unsupported protocol version: {version!r} (expected {PROTOCOL_VERSION})",
+            ),
+        )
+    discriminator = cmd if isinstance(cmd, str) else payload.get("type")
+    if discriminator == "state":
+        # parse_state_line already declined it: known cmd, unusable payload.
+        return (
+            "reply",
+            build_protocol_error("invalid_request", "state envelope must carry a state object"),
+        )
+    return ("reply", build_protocol_error("unknown_cmd", f"unknown message type: {discriminator!r}"))
 
 
 def extract_display(state: Dict[str, Any], now_ms: Optional[float] = None) -> Dict[str, Any]:
@@ -1150,9 +1220,20 @@ def _stdin_reader(stop: threading.Event, pending: "queue.Queue[Tuple[Optional[in
                 continue
         else:
             raw = raw_bytes
-        seq, state = parse_state_line(raw)
-        if state is None:
+        routed = route_stdin_line(raw)
+        if routed is None:
             continue
+        if routed[0] == "reply":
+            # Answered from the reader thread on purpose: emit() performs
+            # exactly one TextIOWrapper.write() plus flush(), and a single
+            # write() call is serialized by the wrapper's internal lock, so a
+            # preview/error line cannot interleave with a state or ack line the
+            # render loop emits concurrently. There is NO explicit Lock in this
+            # module -- line integrity depends on emit() staying single-write,
+            # so it must never be split into multiple write() calls.
+            emit(routed[1])
+            continue
+        seq, state = routed[1], routed[2]
         try:
             pending.put_nowait((seq, state))
         except queue.Full:

@@ -47,7 +47,9 @@ Stuck? See [Troubleshooting](docs/troubleshooting.md) and the
 2. Connect the panel, quit TRCC/SignalRGB, start the app, connect Spotify.
 3. Press play — lyrics appear on the glass within seconds.
 
-Developers: `pnpm install`, then `pnpm start` (needs Windows + panel + Spotify client ID).
+Developers: `pnpm install`, then `pnpm run dev` (Vite + Electron dev loop;
+needs Windows + panel + Spotify client ID). `pnpm run start` runs the built
+production app instead.
 Verify: `python tests/test_registry.py` and `python tests/test_protocol.py` (both should exit 0).
 
 ## Features
@@ -154,7 +156,8 @@ Details: [Architecture](docs/architecture.md) · Shell internals:
 
 ```bash
 pnpm install        # Electron shell deps (pnpm-only; enforced by preinstall guard)
-pnpm start          # shell (needs Windows + panel + Spotify client ID)
+pnpm run dev        # dev loop: Vite + Electron (needs Windows + panel + Spotify client ID)
+pnpm run start      # built production app (build && electron .)
 node tests/test_shell_spawn.js  # headless spawn-path check (needs panel, TRCC closed)
 python tests/test_registry.py
 python tests/test_protocol.py
@@ -172,7 +175,7 @@ pip install -r bridge\requirements.txt
 
 - v0.1 scaffold: structure, configs, panel registry, protocol constants, smoke tests, docs, USB bridge, and Electron shell (headless-verified only — see `docs/shell-notes.md` for GUI paths to test manually).
 - **Unsigned binaries:** v0.1 ships without code signing. Windows SmartScreen will warn on the installer until signing lands. This blocks public release, not local dev/packaging.
-- **TDD note (pending):** no formal test runner is configured yet. `tests/` ships as plain-assert smoke scripts runnable with `python tests/*.py`. Adopting pytest and a red-green-refactor cycle is pending work.
+- **Test runners:** Vitest (`pnpm test`, renderer + main-process, 156 tests) and pytest (`pnpm test:py`, bridge + panels, 26 tests), both hardware-free. The plain-assert scripts under `tests/` still run directly for a quick spot-check.
 - Source of truth for scope and acceptance: `odd/tasks/lyricvision-lcd.md`. Full carryover context: `docs/project-context.md`.
 
 ## Checklist

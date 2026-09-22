@@ -57,8 +57,13 @@ installer. Expected until a signing step lands (out of scope for RC-06).
 
 ## 5. CI coverage
 
-CI smoke (`smoke.yml`) covers **pre-pack checks only**: `pnpm install`,
+CI smoke (`smoke.yml`) runs on every push and pull request and covers
+**pre-pack checks only**: `pnpm install`,
 `pip install -r bridge/requirements.txt`, and the hardware-free
 Python/Node smokes. It does **not** run PyInstaller or electron-builder
-(heavy, needs the Windows toolchain) — packaging stays a local,
-documented step.
+(heavy, needs the Windows toolchain).
+
+Release CI (`release.yml`) runs on `v*` tags: the same hardware-free
+smokes gate the build, then `pyinstaller bridge\lcd_bridge.spec` stages
+`resources\lcd_bridge.exe` and `electron-builder --win nsis` produces the
+unsigned installer plus checksums. Pull requests never pack — only tags do.

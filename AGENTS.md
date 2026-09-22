@@ -55,7 +55,7 @@ docs/                  Architecture, hardware, packaging, troubleshooting docs
 | `pnpm run dev` | Vite dev server + Electron shell | Fast iteration |
 | `pnpm run build` | Production renderer build (`dist/renderer`) | Before committing renderer changes |
 | `npx tsc --noEmit` | TypeScript strict check (renderer only) | Before committing TS/TSX changes |
-| `pnpm test` | Vitest: renderer + main-process suites (6 files, 130 tests) | Hardware-free, before committing JS/TS changes |
+| `pnpm test` | Vitest: renderer + main-process suites (7 files, 156 tests) | Hardware-free, before committing JS/TS changes |
 | `pnpm test:py` | pytest: bridge/panels suites (26 tests) | Hardware-free, before committing Python changes |
 | `pnpm test:all` | Both runners in sequence | Full hardware-free check before committing |
 | `python tests/test_registry.py` etc. | Legacy standalone Python smokes | Quick hardware-free spot-check |

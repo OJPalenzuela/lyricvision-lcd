@@ -1,0 +1,434 @@
+{
+  "$comment": "Shared scene-shape corpus for S0-T1. Each entry pins BOTH implementations (src/renderer/lib/scene.ts isScene, src/hardening.js validateScene) to the same explicit verdict, so dual-copy drift fails at least one suite: tests/renderer/scene.test.ts and tests/unit/scene-validation.test.js both consume this file. JSON text cannot express NaN/Infinity or accessor properties, so numeric edge cases and the throwing-getter regression stay inline in the suites. 'materialize' declares the two shapes JSON cannot produce: array holes (deleteOverlays) and non-index own properties on the array (extraOverlayProps). 'field' is the path validateScene reports; only checked for invalid entries.",
+  "shapes": [
+    {
+      "name": "default-scene",
+      "expect": "valid",
+      "shape": { "version": 1, "background": { "kind": "none" }, "overlays": [] }
+    },
+    {
+      "name": "background-none",
+      "expect": "valid",
+      "shape": {
+        "version": 1,
+        "background": { "kind": "none" },
+        "overlays": [
+          { "kind": "text", "text": "hi", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" }
+        ]
+      }
+    },
+    {
+      "name": "background-color",
+      "expect": "valid",
+      "shape": {
+        "version": 1,
+        "background": { "kind": "color", "color": "#102030" },
+        "overlays": [
+          { "kind": "text", "text": "hi", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" }
+        ]
+      }
+    },
+    {
+      "name": "background-image",
+      "expect": "valid",
+      "shape": {
+        "version": 1,
+        "background": { "kind": "image", "source": "C:/media/bg.png", "rotation": 0, "flipH": false, "scale": 1, "panX": 0, "panY": 0, "fit": "fit" },
+        "overlays": [
+          { "kind": "text", "text": "hi", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" }
+        ]
+      }
+    },
+    {
+      "name": "background-gif",
+      "expect": "valid",
+      "shape": {
+        "version": 1,
+        "background": { "kind": "gif", "source": "data:image/gif;base64,R0lGODlhAQABA", "rotation": 0, "flipH": false, "scale": 1, "panX": 0, "panY": 0, "fit": "fit" },
+        "overlays": [
+          { "kind": "text", "text": "hi", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" }
+        ]
+      }
+    },
+    {
+      "name": "background-video",
+      "expect": "valid",
+      "shape": {
+        "version": 1,
+        "background": { "kind": "video", "source": "C:/media/clip.mp4", "rotation": 0, "flipH": false, "scale": 1, "panX": 0, "panY": 0, "fit": "fit" },
+        "overlays": [
+          { "kind": "text", "text": "hi", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" }
+        ]
+      }
+    },
+    {
+      "name": "rotation-degrees",
+      "expect": "valid",
+      "shape": {
+        "version": 1,
+        "background": { "kind": "image", "source": "bg.png", "rotation": 90, "flipH": true, "scale": 1.5, "panX": 0.25, "panY": 0.75, "fit": "fill" },
+        "overlays": [
+          { "kind": "text", "text": "rot", "x": 0.1, "y": 0.2, "size": 0.3, "rotation": 45, "color": "#ffffff" }
+        ]
+      }
+    },
+    {
+      "name": "color-mixed-case",
+      "expect": "valid",
+      "shape": {
+        "version": 1,
+        "background": { "kind": "color", "color": "#AbCdEf" },
+        "overlays": [
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#AbCdEf" }
+        ]
+      }
+    },
+    {
+      "name": "source-smile-double-dot",
+      "expect": "valid",
+      "shape": {
+        "version": 1,
+        "background": { "kind": "image", "source": "smile..png", "rotation": 0, "flipH": false, "scale": 1, "panX": 0, "panY": 0, "fit": "fit" },
+        "overlays": []
+      }
+    },
+    {
+      "name": "source-data-uri",
+      "expect": "valid",
+      "shape": {
+        "version": 1,
+        "background": { "kind": "image", "source": "data:image/png;base64,iVBORw0KGgo=", "rotation": 0, "flipH": false, "scale": 1, "panX": 0, "panY": 0, "fit": "fit" },
+        "overlays": []
+      }
+    },
+    {
+      "name": "overlays-at-cap",
+      "expect": "valid",
+      "shape": {
+        "version": 1,
+        "background": { "kind": "none" },
+        "overlays": [
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" }
+        ]
+      }
+    },
+    {
+      "name": "overlays-over-cap",
+      "expect": "invalid",
+      "field": "overlays",
+      "shape": {
+        "version": 1,
+        "background": { "kind": "none" },
+        "overlays": [
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" }
+        ]
+      }
+    },
+    {
+      "name": "overlays-sparse-hole",
+      "expect": "invalid",
+      "field": "overlays[1]",
+      "shape": {
+        "version": 1,
+        "background": { "kind": "none" },
+        "overlays": [
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" }
+        ]
+      },
+      "materialize": { "deleteOverlays": [1] }
+    },
+    {
+      "name": "overlays-extra-own-prop",
+      "expect": "invalid",
+      "field": "overlays",
+      "shape": {
+        "version": 1,
+        "background": { "kind": "none" },
+        "overlays": [
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" },
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" }
+        ]
+      },
+      "materialize": { "extraOverlayProps": { "evil": 1 } }
+    },
+    {
+      "name": "scene-unknown-key",
+      "expect": "invalid",
+      "field": "evil",
+      "shape": { "version": 1, "background": { "kind": "none" }, "overlays": [], "evil": true }
+    },
+    {
+      "name": "scene-proto-key",
+      "expect": "invalid",
+      "field": "__proto__",
+      "shape": { "version": 1, "background": { "kind": "none" }, "overlays": [], "__proto__": { "polluted": true } }
+    },
+    {
+      "name": "scene-constructor-key",
+      "expect": "invalid",
+      "field": "constructor",
+      "shape": { "version": 1, "background": { "kind": "none" }, "overlays": [], "constructor": 1 }
+    },
+    {
+      "name": "background-unknown-key",
+      "expect": "invalid",
+      "field": "background.evil",
+      "shape": { "version": 1, "background": { "kind": "none", "evil": true }, "overlays": [] }
+    },
+    {
+      "name": "background-kind-unknown",
+      "expect": "invalid",
+      "field": "background.kind",
+      "shape": { "version": 1, "background": { "kind": "unknown" }, "overlays": [] }
+    },
+    {
+      "name": "background-color-shorthand",
+      "expect": "invalid",
+      "field": "background.color",
+      "shape": { "version": 1, "background": { "kind": "color", "color": "#fff" }, "overlays": [] }
+    },
+    {
+      "name": "background-color-invalid-hex",
+      "expect": "invalid",
+      "field": "background.color",
+      "shape": { "version": 1, "background": { "kind": "color", "color": "#GGGGGG" }, "overlays": [] }
+    },
+    {
+      "name": "background-color-seven-digits",
+      "expect": "invalid",
+      "field": "background.color",
+      "shape": { "version": 1, "background": { "kind": "color", "color": "#1234567" }, "overlays": [] }
+    },
+    {
+      "name": "background-scale-zero",
+      "expect": "invalid",
+      "field": "background.scale",
+      "shape": { "version": 1, "background": { "kind": "image", "source": "bg.png", "rotation": 0, "flipH": false, "scale": 0, "panX": 0, "panY": 0, "fit": "fit" }, "overlays": [] }
+    },
+    {
+      "name": "background-fit-invalid",
+      "expect": "invalid",
+      "field": "background.fit",
+      "shape": { "version": 1, "background": { "kind": "image", "source": "bg.png", "rotation": 0, "flipH": false, "scale": 1, "panX": 0, "panY": 0, "fit": "stretch" }, "overlays": [] }
+    },
+    {
+      "name": "background-rotation-string",
+      "expect": "invalid",
+      "field": "background.rotation",
+      "shape": { "version": 1, "background": { "kind": "image", "source": "bg.png", "rotation": "90", "flipH": false, "scale": 1, "panX": 0, "panY": 0, "fit": "fit" }, "overlays": [] }
+    },
+    {
+      "name": "source-traversal-posix",
+      "expect": "invalid",
+      "field": "background.source",
+      "shape": { "version": 1, "background": { "kind": "image", "source": "a/../b.png", "rotation": 0, "flipH": false, "scale": 1, "panX": 0, "panY": 0, "fit": "fit" }, "overlays": [] }
+    },
+    {
+      "name": "source-traversal-windows",
+      "expect": "invalid",
+      "field": "background.source",
+      "shape": { "version": 1, "background": { "kind": "video", "source": "..\\..\\clip.mp4", "rotation": 0, "flipH": false, "scale": 1, "panX": 0, "panY": 0, "fit": "fit" }, "overlays": [] }
+    },
+    {
+      "name": "source-nul-byte",
+      "expect": "invalid",
+      "field": "background.source",
+      "shape": { "version": 1, "background": { "kind": "gif", "source": "a\u0000b", "rotation": 0, "flipH": false, "scale": 1, "panX": 0, "panY": 0, "fit": "fit" }, "overlays": [] }
+    },
+    {
+      "name": "source-empty",
+      "expect": "invalid",
+      "field": "background.source",
+      "shape": { "version": 1, "background": { "kind": "gif", "source": "", "rotation": 0, "flipH": false, "scale": 1, "panX": 0, "panY": 0, "fit": "fit" }, "overlays": [] }
+    },
+    {
+      "name": "overlay-unknown-key",
+      "expect": "invalid",
+      "field": "overlays[0].extra",
+      "shape": {
+        "version": 1,
+        "background": { "kind": "none" },
+        "overlays": [
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff", "extra": 1 }
+        ]
+      }
+    },
+    {
+      "name": "overlay-prototype-key",
+      "expect": "invalid",
+      "field": "overlays[0].prototype",
+      "shape": {
+        "version": 1,
+        "background": { "kind": "none" },
+        "overlays": [
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff", "prototype": 1 }
+        ]
+      }
+    },
+    {
+      "name": "overlay-kind-unknown",
+      "expect": "invalid",
+      "field": "overlays[0].kind",
+      "shape": {
+        "version": 1,
+        "background": { "kind": "none" },
+        "overlays": [
+          { "kind": "needle", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" }
+        ]
+      }
+    },
+    {
+      "name": "overlay-color-named",
+      "expect": "invalid",
+      "field": "overlays[0].color",
+      "shape": {
+        "version": 1,
+        "background": { "kind": "none" },
+        "overlays": [
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 0, "color": "blue" }
+        ]
+      }
+    },
+    {
+      "name": "overlay-x-epsilon",
+      "expect": "invalid",
+      "field": "overlays[0].x",
+      "shape": {
+        "version": 1,
+        "background": { "kind": "none" },
+        "overlays": [
+          { "kind": "gpu-temp", "x": 1.0000001, "y": 0.5, "size": 0.1, "rotation": 0, "color": "#ffffff" }
+        ]
+      }
+    },
+    {
+      "name": "overlay-y-negative",
+      "expect": "invalid",
+      "field": "overlays[0].y",
+      "shape": {
+        "version": 1,
+        "background": { "kind": "none" },
+        "overlays": [
+          { "kind": "gpu-temp", "x": 0.5, "y": -0.1, "size": 0.1, "rotation": 0, "color": "#ffffff" }
+        ]
+      }
+    },
+    {
+      "name": "overlay-size-epsilon",
+      "expect": "invalid",
+      "field": "overlays[0].size",
+      "shape": {
+        "version": 1,
+        "background": { "kind": "none" },
+        "overlays": [
+          { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 1.0000001, "rotation": 0, "color": "#ffffff" }
+        ]
+      }
+    },
+    {
+      "name": "version-two",
+      "expect": "invalid",
+      "field": "version",
+      "shape": { "version": 2, "background": { "kind": "none" }, "overlays": [] }
+    },
+    {
+      "name": "version-string",
+      "expect": "invalid",
+      "field": "version",
+      "shape": { "version": "1", "background": { "kind": "none" }, "overlays": [] }
+    },
+    {
+      "name": "version-fraction",
+      "expect": "invalid",
+      "field": "version",
+      "shape": { "version": 1.5, "background": { "kind": "none" }, "overlays": [] }
+    },
+    {
+      "name": "version-missing",
+      "expect": "invalid",
+      "field": "version",
+      "shape": { "background": { "kind": "none" }, "overlays": [] }
+    },
+    {
+      "name": "root-not-object",
+      "expect": "invalid",
+      "field": "<root>",
+      "shape": null
+    },
+    {
+      "name": "root-string",
+      "expect": "invalid",
+      "field": "<root>",
+      "shape": "scene"
+    }
+  ]
+}

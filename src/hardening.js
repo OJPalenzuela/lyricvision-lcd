@@ -181,6 +181,243 @@ function buildDiagnostics({ settings, lcdStatus, ringEntries, versions, bridge }
   };
 }
 
+// ---------------------------------------------------------------------------
+// Scene gate (S0-T1) — authoritative validator for the settings:save `scene`
+// key. Mirrors the type guards in src/renderer/lib/scene.ts: the renderer copy
+// gives the editor instant feedback, THIS copy gates input that never passed
+// TypeScript. Policy: reject, never clamp/coerce — a bad value is a bug to
+// surface, not to paper over. Stays pure (no fs, no electron).
+// ---------------------------------------------------------------------------
+
+const SCENE_VERSION = 1;
+// Bounds per-frame overlay cost: every overlay is a live render node the
+// bridge composites at LCD fps. Kept in lockstep with the renderer model.
+const SCENE_OVERLAYS_CAP = 32;
+// Blank portrait scene. src/renderer/lib/scene.ts keeps an identical copy —
+// lockstep-tested in tests/renderer/scene.test.ts.
+const DEFAULT_SCENE = { version: 1, background: { kind: 'none' }, overlays: [] };
+
+const SCENE_KEYS = ['version', 'background', 'overlays'];
+const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
+
+function sceneReject(field, error) {
+  return { ok: false, field, error };
+}
+
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/** First key of `value` outside `allowed` (null when the shape is clean). */
+function firstUnknownKey(value, allowed) {
+  for (const key of Object.keys(value)) {
+    if (!allowed.includes(key)) return key;
+  }
+  return null;
+}
+
+/**
+ * First own enumerable key of an ARRAY that is not one of its canonical
+ * index keys ("evil", "1.5", "007" all qualify). Object.keys skips holes, so
+ * a hole is reported by the index loop in validateSceneShape instead.
+ */
+function firstNonIndexKey(value) {
+  const length = value.length;
+  for (const key of Object.keys(value)) {
+    const index = Number(key);
+    if (!Number.isInteger(index) || index < 0 || index >= length || String(index) !== key) {
+      return key;
+    }
+  }
+  return null;
+}
+
+function isHexColor(value) {
+  return typeof value === 'string' && HEX_COLOR_RE.test(value);
+}
+
+function isFiniteNumber(value) {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+function isUnitFraction(value) {
+  return isFiniteNumber(value) && value >= 0 && value <= 1;
+}
+
+/**
+ * Source gate: non-empty string, no NUL (C-level path APIs truncate there),
+ * and no ".." SEGMENT across either separator — "smile..png" stays legal.
+ */
+function isSource(value) {
+  if (typeof value !== 'string' || value.length === 0) return false;
+  if (value.indexOf('\u0000') !== -1) return false;
+  return !value.split(/[/\\]/).includes('..');
+}
+
+/** Allowed keys per background kind; null = unknown discriminant (reject). */
+function backgroundKeys(kind) {
+  switch (kind) {
+    case 'none':
+      return ['kind'];
+    case 'color':
+      return ['kind', 'color'];
+    case 'image':
+    case 'gif':
+    case 'video':
+      return ['kind', 'source', 'rotation', 'flipH', 'scale', 'panX', 'panY', 'fit'];
+    default:
+      return null;
+  }
+}
+
+/** Allowed keys per overlay kind; null = unknown discriminant (reject). */
+function overlayKeys(kind) {
+  switch (kind) {
+    case 'text':
+      return ['kind', 'text', 'x', 'y', 'size', 'rotation', 'color'];
+    case 'gpu-temp':
+      return ['kind', 'x', 'y', 'size', 'rotation', 'color'];
+    default:
+      return null;
+  }
+}
+
+/** @returns {{ok:true, value:object}|{ok:false, field:string, error:string}} */
+function validateSceneBackground(value) {
+  if (!isPlainObject(value)) return sceneReject('background', 'background must be an object');
+  const allowed = backgroundKeys(value.kind);
+  if (!allowed) return sceneReject('background.kind', `unknown background kind: ${String(value.kind)}`);
+  const unknownKey = firstUnknownKey(value, allowed);
+  if (unknownKey !== null) {
+    return sceneReject(`background.${unknownKey}`, `unknown background key: ${unknownKey}`);
+  }
+  switch (value.kind) {
+    case 'none':
+      return { ok: true, value: { kind: 'none' } };
+    case 'color':
+      if (!isHexColor(value.color)) return sceneReject('background.color', 'color must match #rrggbb');
+      return { ok: true, value: { kind: 'color', color: value.color } };
+    case 'image':
+    case 'gif':
+    case 'video': {
+      if (!isSource(value.source)) {
+        return sceneReject('background.source', 'source must be a non-empty string without NUL or ".." segments');
+      }
+      if (!isFiniteNumber(value.rotation)) return sceneReject('background.rotation', 'rotation must be a finite number');
+      if (typeof value.flipH !== 'boolean') return sceneReject('background.flipH', 'flipH must be a boolean');
+      if (typeof value.scale !== 'number' || !Number.isFinite(value.scale) || value.scale <= 0) {
+        return sceneReject('background.scale', 'scale must be a finite number greater than 0');
+      }
+      if (!isFiniteNumber(value.panX)) return sceneReject('background.panX', 'panX must be a finite number');
+      if (!isFiniteNumber(value.panY)) return sceneReject('background.panY', 'panY must be a finite number');
+      if (value.fit !== 'fit' && value.fit !== 'fill') return sceneReject('background.fit', "fit must be 'fit' or 'fill'");
+      return {
+        ok: true,
+        value: {
+          kind: value.kind,
+          source: value.source,
+          rotation: value.rotation,
+          flipH: value.flipH,
+          scale: value.scale,
+          panX: value.panX,
+          panY: value.panY,
+          fit: value.fit,
+        },
+      };
+    }
+    default:
+      // Unreachable: backgroundKeys() already rejected unknown discriminants.
+      return sceneReject('background.kind', `unknown background kind: ${String(value.kind)}`);
+  }
+}
+
+/** @returns {{ok:true, value:object}|{ok:false, field:string, error:string}} */
+function validateSceneOverlay(value, index) {
+  const at = `overlays[${index}]`;
+  if (!isPlainObject(value)) return sceneReject(at, 'overlay must be an object');
+  const allowed = overlayKeys(value.kind);
+  if (!allowed) return sceneReject(`${at}.kind`, `unknown overlay kind: ${String(value.kind)}`);
+  const unknownKey = firstUnknownKey(value, allowed);
+  if (unknownKey !== null) {
+    return sceneReject(`${at}.${unknownKey}`, `unknown overlay key: ${unknownKey}`);
+  }
+  if (value.kind === 'text' && typeof value.text !== 'string') {
+    return sceneReject(`${at}.text`, 'text must be a string');
+  }
+  if (!isUnitFraction(value.x)) return sceneReject(`${at}.x`, 'x must be a fraction in [0,1]');
+  if (!isUnitFraction(value.y)) return sceneReject(`${at}.y`, 'y must be a fraction in [0,1]');
+  if (!isUnitFraction(value.size)) return sceneReject(`${at}.size`, 'size must be a fraction in [0,1]');
+  if (!isFiniteNumber(value.rotation)) return sceneReject(`${at}.rotation`, 'rotation must be a finite number');
+  if (!isHexColor(value.color)) return sceneReject(`${at}.color`, 'color must match #rrggbb');
+  const overlay =
+    value.kind === 'text'
+      ? {
+          kind: 'text',
+          text: value.text,
+          x: value.x,
+          y: value.y,
+          size: value.size,
+          rotation: value.rotation,
+          color: value.color,
+        }
+      : {
+          kind: 'gpu-temp',
+          x: value.x,
+          y: value.y,
+          size: value.size,
+          rotation: value.rotation,
+          color: value.color,
+        };
+  return { ok: true, value: overlay };
+}
+
+/**
+ * Validate untrusted scene JSON. Returns a sanitized copy on success (built
+ * field-by-field from validated values — never spread from input) or the
+ * offending field path (e.g. 'overlays[0].x', 'background.source') on reject.
+ * TOTAL by contract: any internal exception (throwing getter, proxy) becomes
+ * {ok:false, field:'<unknown>'} — a settings gate must never throw.
+ * @returns {{ok:true, scene:object}|{ok:false, field:string, error:string}}
+ */
+function validateScene(input) {
+  try {
+    return validateSceneShape(input);
+  } catch (err) {
+    return sceneReject('<unknown>', `scene validation failed: ${String(err)}`);
+  }
+}
+
+/** @returns {{ok:true, scene:object}|{ok:false, field:string, error:string}} */
+function validateSceneShape(input) {
+  if (!isPlainObject(input)) return sceneReject('<root>', 'scene must be an object');
+  const unknownKey = firstUnknownKey(input, SCENE_KEYS);
+  if (unknownKey !== null) return sceneReject(unknownKey, `unknown scene key: ${unknownKey}`);
+  if (input.version !== SCENE_VERSION) return sceneReject('version', `version must be ${SCENE_VERSION}`);
+  const background = validateSceneBackground(input.background);
+  if (!background.ok) return background;
+  if (!Array.isArray(input.overlays)) return sceneReject('overlays', 'overlays must be an array');
+  // Unknown keys are rejected at EVERY level, the array included: an own
+  // non-index property is drift (the renderer guard rejects it too — verdicts
+  // must match). Reject outright instead of silently stripping it on rebuild.
+  const extraKey = firstNonIndexKey(input.overlays);
+  if (extraKey !== null) {
+    return sceneReject('overlays', `overlays must not define own non-index property: ${extraKey}`);
+  }
+  if (input.overlays.length > SCENE_OVERLAYS_CAP) {
+    return sceneReject('overlays', `overlays exceeds the cap of ${SCENE_OVERLAYS_CAP}`);
+  }
+  const overlays = [];
+  for (let i = 0; i < input.overlays.length; i += 1) {
+    const result = validateSceneOverlay(input.overlays[i], i);
+    if (!result.ok) return result;
+    overlays.push(result.value);
+  }
+  return {
+    ok: true,
+    scene: { version: input.version, background: background.value, overlays },
+  };
+}
+
 module.exports = {
   RING_CAP,
   WATCHDOG_TIMEOUT_MS,
@@ -191,4 +428,9 @@ module.exports = {
   createBridgeWatchdog,
   redactSettings,
   buildDiagnostics,
+  // Scene gate (S0-T1): validator + shared constants for the settings `scene`
+  // key. DEFAULT_SCENE/SCENE_OVERLAYS_CAP mirror src/renderer/lib/scene.ts.
+  validateScene,
+  DEFAULT_SCENE,
+  SCENE_OVERLAYS_CAP,
 };

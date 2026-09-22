@@ -11,6 +11,8 @@ Direction for LyricVision LCD. No dates — order only. Source of truth for scop
 - Dev-loop correctness: `scripts/dev.js` polls a hardcoded 5173 while plain `vite` auto-increments, so Electron can attach to the wrong server (use `--strictPort`); its `child.kill()` sends SIGTERM, which Win32 ignores, leaving orphaned vite/electron processes after Ctrl-C (needs `taskkill /T /F`).
 - Dev docs drift: `pnpm start` now means `build && electron .` (production). Docs and comments that still describe it as the dev command must move to `pnpm run dev`.
 - Honest exclusivity copy: the status line reads "No exclusive holder detected" but `detectExclusivityHolders()` only scans `tasklist` for `trcc.exe`/`signalrgb.exe` — it never inspects the real device handle. Reword so the UI does not claim more than it verifies.
+- Resolved: sidecar shutdown crash (exit `3221225477` / `0xC0000005`) — the daemon stdin reader held a lock on the shared `BufferedReader` while shutdown finalized `sys.stdin`. Fixed in `bridge/lcd_bridge.py` by reading from `os.fdopen(os.dup(0), "rb")` instead (commit `342bd94`). Only exercised by the hardware-gated `pnpm run verify:spawn`, which stays unrun without a panel.
+- Resolved: first frame arrived with no ack (`expected 3 acks, got 2`) — `reader.start()` ran after `open_device()`; it now runs before USB bring-up in `bridge/lcd_bridge.py` (commit `342bd94`). Not covered by an automated assertion: none of the 26 pytest cases checks ack ordering, and the only `expected N acks` check lives in `tests/test_shell_spawn.js`, which is hardware-gated behind `pnpm run verify:spawn`.
 
 ## v0.2 (next)
 

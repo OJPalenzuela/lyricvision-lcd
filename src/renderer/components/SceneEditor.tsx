@@ -3,7 +3,9 @@ import {
   useRef,
   useState,
   useCallback,
+  useMemo,
   type KeyboardEvent as ReactKeyboardEvent,
+  type ReactNode,
 } from "react";
 
 import { Redo2, Undo2 } from "lucide-react";
@@ -24,6 +26,11 @@ import {
   type MediaBackgroundKind,
   type Scene,
 } from "@/lib/scene";
+import {
+  validateSceneForEditor,
+  validateSceneForModel,
+  type SceneValidationIssue,
+} from "@/lib/sceneSchema";
 import { useCanRedo, useCanUndo, useSceneStore } from "@/lib/sceneStore";
 
 /**
@@ -353,6 +360,45 @@ const SCENE_SECTIONS = [
 
 type SceneSectionId = (typeof SCENE_SECTIONS)[number]["id"];
 
+type AriaValidationProps = {
+  "aria-invalid"?: true;
+  "aria-describedby"?: string;
+};
+
+function findValidationIssue(
+  issues: readonly SceneValidationIssue[],
+  paths: readonly string[]
+): SceneValidationIssue | undefined {
+  return issues.find((issue) => paths.includes(issue.path));
+}
+
+function validationProps(
+  field: string,
+  issues: readonly SceneValidationIssue[],
+  paths: readonly string[]
+): AriaValidationProps {
+  return findValidationIssue(issues, paths)
+    ? {
+        "aria-invalid": true,
+        "aria-describedby": `${field}-error`,
+      }
+    : {};
+}
+
+function validationMessage(
+  field: string,
+  issues: readonly SceneValidationIssue[],
+  paths: readonly string[]
+): ReactNode {
+  const issue = findValidationIssue(issues, paths);
+  if (!issue) return null;
+  return (
+    <p id={`${field}-error`} role="status" className="text-xs text-destructive">
+      {issue.message}
+    </p>
+  );
+}
+
 interface SceneEditorProps {
   scene: Scene;
   onSceneChange: (scene: Scene) => void;
@@ -407,9 +453,9 @@ export default function SceneEditor({
       useSceneStore.temporal.getState().resume();
       return;
     }
-    onSceneChange(active.snapshot); // unrecorded rewind (still paused)
+    commitScene(active.snapshot); // unrecorded rewind (still paused)
     useSceneStore.temporal.getState().resume();
-    onSceneChange(scene); // final value -> exactly ONE history entry
+    commitScene(scene); // final value -> exactly ONE history entry
   };
 
   const beginCoalesce = (owner: CoalesceOwner, snapshot: Scene): void => {
@@ -486,6 +532,9 @@ export default function SceneEditor({
   const [saveError, setSaveError] = useState<string | null>(null);
   const [savedNote, setSavedNote] = useState<string | null>(null);
   const [importError, setImportError] = useState<string | null>(null);
+  const [draftValidationIssues, setDraftValidationIssues] = useState<
+    SceneValidationIssue[]
+  >([]);
 
   // S7-T20 history controls: reactive against zundo's temporal store, so
   // the buttons disable live at both ends of history (empty at boot root).
@@ -506,6 +555,69 @@ export default function SceneEditor({
     scene.background.kind === "color" ? scene.background.color : COLOR_FALLBACK;
   const mediaBackground = isMediaKind(scene.background) ? scene.background : null;
   const atCap = overlays.length >= SCENE_OVERLAYS_CAP;
+
+  // Observe the current/hydrated scene for feedback only. App/store hydration
+  // remains untouched; the authoritative save and USB gates stay in main/Python.
+  const currentValidation = useMemo(
+    () => validateSceneForEditor(scene),
+    [scene]
+  );
+  const currentValidationIssues = currentValidation.success
+    ? []
+    : currentValidation.issues;
+  const validationIssues =
+    draftValidationIssues.length > 0
+      ? draftValidationIssues
+      : currentValidationIssues;
+
+  // A rejected candidate never reaches the store. Restore controlled drafts
+  // from the store-owned scene so a failed numeric edit cannot leave a value
+  // visible that the canvas and persistence path never accepted. Non-media
+  // transform drafts remain staged by design and are carried into an import.
+  const restoreRejectedDrafts = (): void => {
+    const overlay = safeIndex >= 0 ? scene.overlays[safeIndex] ?? null : null;
+    setUnitDrafts(
+      overlay
+        ? {
+            x: String(overlay.x),
+            y: String(overlay.y),
+            size: String(overlay.size),
+            rotation: String(overlay.rotation),
+          }
+        : EMPTY_UNIT_DRAFTS
+    );
+    const background = scene.background;
+    if (!isMediaKind(background)) return;
+    setTransform({
+      rotation: String(background.rotation),
+      scale: String(background.scale),
+      panX: String(background.panX),
+      panY: String(background.panY),
+    });
+    setFlipH(background.flipH);
+    setFit(background.fit);
+  };
+
+  const selectedOverlayPath = (field: string): string =>
+    safeIndex >= 0 ? `overlays[${safeIndex}].${field}` : "scene";
+
+  // A failed local candidate never reaches onSceneChange, so zundo cannot
+  // record a validation-only entry; IPC still validates independently on save.
+  // Acceptance follows the frozen model, while the editor policy remains
+  // warning-only in currentValidation below.
+  const commitScene = (next: Scene): boolean => {
+    const validation = validateSceneForModel(next);
+    if (!validation.success) {
+      setDraftValidationIssues(validation.issues);
+      restoreRejectedDrafts();
+      setSavedNote(null);
+      return false;
+    }
+    setDraftValidationIssues([]);
+    onSceneChange(next);
+    setSavedNote(null);
+    return true;
+  };
 
   // Keep drafts aligned with the selected overlay whenever the scene or the
   // selection changes (add/remove/switch/Reset all flow through here).
@@ -606,7 +718,7 @@ export default function SceneEditor({
     });
 
   const commitOverlays = (next: Scene["overlays"]) =>
-    onSceneChange({ ...scene, overlays: next });
+    commitScene({ ...scene, overlays: next });
 
   /**
    * S7-T21 gesture bridge to the Konva stage (SceneStage.tsx owns
@@ -669,6 +781,21 @@ export default function SceneEditor({
     if (from < 0 || from >= overlays.length) return;
     if (to < 0 || to >= overlays.length) return;
     const anchor = safeIndex >= 0 ? overlays[safeIndex] ?? null : null;
+    const reordered = overlays.slice();
+    const moved = reordered[from];
+    if (!moved) return;
+    reordered.splice(from, 1);
+    reordered.splice(to, 0, moved);
+    const validation = validateSceneForModel({
+      ...scene,
+      overlays: reordered,
+    });
+    if (!validation.success) {
+      setDraftValidationIssues(validation.issues);
+      setSavedNote(null);
+      return;
+    }
+    setDraftValidationIssues([]);
     useSceneStore.getState().reorderOverlays(from, to);
     if (!anchor) return;
     const next = useSceneStore.getState().scene.overlays;
@@ -730,7 +857,7 @@ export default function SceneEditor({
     // the hint below the section) instead of failing validateScene.
     const current = scene.background;
     if (!result || !isMediaKind(current)) return;
-    onSceneChange({
+    commitScene({
       ...scene,
       background: { ...current, [field]: result.commit },
     });
@@ -741,7 +868,7 @@ export default function SceneEditor({
     setFlipH(next);
     const current = scene.background;
     if (!isMediaKind(current)) return;
-    onSceneChange({ ...scene, background: { ...current, flipH: next } });
+    commitScene({ ...scene, background: { ...current, flipH: next } });
     setSavedNote(null);
   };
 
@@ -749,7 +876,7 @@ export default function SceneEditor({
     setFit(next);
     const current = scene.background;
     if (!isMediaKind(current)) return;
-    onSceneChange({ ...scene, background: { ...current, fit: next } });
+    commitScene({ ...scene, background: { ...current, fit: next } });
     setSavedNote(null);
   };
 
@@ -789,12 +916,12 @@ export default function SceneEditor({
     if (scene.background.kind === "color" && scene.background.color === hex) {
       return;
     }
-    onSceneChange({ ...scene, background: { kind: "color", color: hex } });
+    commitScene({ ...scene, background: { kind: "color", color: hex } });
     setSavedNote(null);
   };
 
   const pickBackground = (kind: "none" | "color") => {
-    onSceneChange({
+    commitScene({
       ...scene,
       background:
         kind === "color"
@@ -839,14 +966,14 @@ export default function SceneEditor({
       panY: stagedValue(transform.panY, TRANSFORM_RANGES.panY, 0),
       fit,
     };
-    onSceneChange({ ...scene, background: next });
+    commitScene({ ...scene, background: next });
     setSavedNote(null);
   };
 
   const clearBackground = () => {
     // Dropping media returns to none; the staged drafts stay local so a
     // re-import carries them forward again.
-    onSceneChange({ ...scene, background: { kind: "none" } });
+    commitScene({ ...scene, background: { kind: "none" } });
     setSavedNote(null);
     setImportError(null);
   };
@@ -886,6 +1013,11 @@ export default function SceneEditor({
     }
     setSaveError(null);
     setSavedNote(null);
+    // Feedback only: the main-process and Python validators remain the save
+    // authority. An invalid persisted/external scene is still sent so this
+    // renderer never silently changes the existing pipeline contract.
+    const validation = validateSceneForEditor(scene);
+    setDraftValidationIssues(validation.success ? [] : validation.issues);
     try {
       const { rejected } = await bridge.saveSettings({ scene });
       if (rejected && rejected.includes("scene")) {
@@ -907,6 +1039,7 @@ export default function SceneEditor({
     setSaveError(null);
     setSavedNote(null);
     setImportError(null);
+    setDraftValidationIssues([]);
   };
 
   /**
@@ -995,7 +1128,17 @@ export default function SceneEditor({
                 type="color"
                 value={HEX_COLOR.test(backgroundColor) ? backgroundColor : COLOR_FALLBACK}
                 onChange={(e) => handleBackgroundColor(e.target.value)}
+                {...validationProps(
+                  "scene-background-color",
+                  validationIssues,
+                  ["background.color"]
+                )}
               />
+              {validationMessage(
+                "scene-background-color",
+                validationIssues,
+                ["background.color"]
+              )}
             </div>
           </div>
         )}
@@ -1035,7 +1178,17 @@ export default function SceneEditor({
               inputMode="decimal"
               value={transform.rotation}
               onChange={(e) => handleTransform("rotation", e.target.value)}
+              {...validationProps(
+                "scene-rotation",
+                validationIssues,
+                ["background.rotation"]
+              )}
             />
+            {validationMessage(
+              "scene-rotation",
+              validationIssues,
+              ["background.rotation"]
+            )}
           </div>
           <div className="space-y-1">
             <Label htmlFor="scene-scale">Scale</Label>
@@ -1044,7 +1197,9 @@ export default function SceneEditor({
               inputMode="decimal"
               value={transform.scale}
               onChange={(e) => handleTransform("scale", e.target.value)}
+              {...validationProps("scene-scale", validationIssues, ["background.scale"])}
             />
+            {validationMessage("scene-scale", validationIssues, ["background.scale"])}
           </div>
           <div className="space-y-1">
             <Label htmlFor="scene-pan-x">Pan X (-1 to 1)</Label>
@@ -1053,7 +1208,9 @@ export default function SceneEditor({
               inputMode="decimal"
               value={transform.panX}
               onChange={(e) => handleTransform("panX", e.target.value)}
+              {...validationProps("scene-pan-x", validationIssues, ["background.panX"])}
             />
+            {validationMessage("scene-pan-x", validationIssues, ["background.panX"])}
           </div>
           <div className="space-y-1">
             <Label htmlFor="scene-pan-y">Pan Y (-1 to 1)</Label>
@@ -1062,7 +1219,9 @@ export default function SceneEditor({
               inputMode="decimal"
               value={transform.panY}
               onChange={(e) => handleTransform("panY", e.target.value)}
+              {...validationProps("scene-pan-y", validationIssues, ["background.panY"])}
             />
+            {validationMessage("scene-pan-y", validationIssues, ["background.panY"])}
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-3">
@@ -1074,7 +1233,16 @@ export default function SceneEditor({
             />
             Flip horizontally
           </Label>
-          <div className="flex gap-2">
+          <div
+            className="flex gap-2"
+            role="group"
+            aria-label="Background fit"
+            aria-describedby={
+              findValidationIssue(validationIssues, ["background.fit"])
+                ? "scene-fit-error"
+                : undefined
+            }
+          >
             <Button
               type="button"
               size="sm"
@@ -1094,6 +1262,7 @@ export default function SceneEditor({
               Fill
             </Button>
           </div>
+          {validationMessage("scene-fit", validationIssues, ["background.fit"])}
         </div>
         {!mediaBackground && (
           <p className="text-xs text-muted-foreground">
@@ -1171,7 +1340,17 @@ export default function SceneEditor({
                   maxLength={SCENE_MAX_TEXT_CHARS}
                   value={selectedOverlay.text}
                   onChange={(e) => handleText(e.target.value)}
+                  {...validationProps(
+                    "overlay-text",
+                    validationIssues,
+                    [selectedOverlayPath("text")]
+                  )}
                 />
+                {validationMessage(
+                  "overlay-text",
+                  validationIssues,
+                  [selectedOverlayPath("text")]
+                )}
               </div>
             )}
             <div className="space-y-1">
@@ -1181,7 +1360,17 @@ export default function SceneEditor({
                 inputMode="decimal"
                 value={unitDrafts.x}
                 onChange={(e) => handleUnit("x", e.target.value)}
+                {...validationProps(
+                  "overlay-x",
+                  validationIssues,
+                  [selectedOverlayPath("x")]
+                )}
               />
+              {validationMessage(
+                "overlay-x",
+                validationIssues,
+                [selectedOverlayPath("x")]
+              )}
             </div>
             <div className="space-y-1">
               <Label htmlFor="overlay-y">Overlay Y (0-1)</Label>
@@ -1190,7 +1379,17 @@ export default function SceneEditor({
                 inputMode="decimal"
                 value={unitDrafts.y}
                 onChange={(e) => handleUnit("y", e.target.value)}
+                {...validationProps(
+                  "overlay-y",
+                  validationIssues,
+                  [selectedOverlayPath("y")]
+                )}
               />
+              {validationMessage(
+                "overlay-y",
+                validationIssues,
+                [selectedOverlayPath("y")]
+              )}
             </div>
             <div className="space-y-1">
               <Label htmlFor="overlay-size">Overlay size (0-1)</Label>
@@ -1199,7 +1398,17 @@ export default function SceneEditor({
                 inputMode="decimal"
                 value={unitDrafts.size}
                 onChange={(e) => handleUnit("size", e.target.value)}
+                {...validationProps(
+                  "overlay-size",
+                  validationIssues,
+                  [selectedOverlayPath("size")]
+                )}
               />
+              {validationMessage(
+                "overlay-size",
+                validationIssues,
+                [selectedOverlayPath("size")]
+              )}
             </div>
             <div className="space-y-1">
               <Label htmlFor="overlay-rotation">Overlay rotation (degrees)</Label>
@@ -1208,7 +1417,17 @@ export default function SceneEditor({
                 inputMode="decimal"
                 value={unitDrafts.rotation}
                 onChange={(e) => handleUnit("rotation", e.target.value)}
+                {...validationProps(
+                  "overlay-rotation",
+                  validationIssues,
+                  [selectedOverlayPath("rotation")]
+                )}
               />
+              {validationMessage(
+                "overlay-rotation",
+                validationIssues,
+                [selectedOverlayPath("rotation")]
+              )}
             </div>
             <div className="space-y-1">
               <Label htmlFor="overlay-color">Overlay color</Label>
@@ -1235,7 +1454,17 @@ export default function SceneEditor({
                     HEX_COLOR.test(selectedOverlay.color) ? selectedOverlay.color : "#ffffff"
                   }
                   onChange={(e) => handleOverlayColor(e.target.value)}
+                  {...validationProps(
+                    "overlay-color",
+                    validationIssues,
+                    [selectedOverlayPath("color")]
+                  )}
                 />
+                {validationMessage(
+                  "overlay-color",
+                  validationIssues,
+                  [selectedOverlayPath("color")]
+                )}
               </div>
             </div>
           </motion.div>
@@ -1305,6 +1534,24 @@ export default function SceneEditor({
     </>
   );
 
+  const validationSummary =
+    validationIssues.length > 0 ? (
+      <div
+        role="alert"
+        aria-live="assertive"
+        className="rounded-md border border-destructive/40 p-3 text-sm"
+      >
+        <p className="font-medium">Scene needs attention.</p>
+        <ul className="list-disc space-y-1 pl-5">
+          {validationIssues.map((issue) => (
+            <li key={`${issue.path}:${issue.message}`}>
+              {issue.path}: {issue.message}
+            </li>
+          ))}
+        </ul>
+      </div>
+    ) : null;
+
   const activeLabel =
     SCENE_SECTIONS.find((item) => item.id === section)?.label ??
     SCENE_SECTIONS[0].label;
@@ -1316,6 +1563,7 @@ export default function SceneEditor({
       onFocus={handleRootFocus}
       onBlur={handleRootBlur}
     >
+      {validationSummary}
       {/* S7-T19 persistent rail: pick a section and edit immediately —
           there is no enter/exit edit mode anymore. aria-pressed mirrors
           the switch, the same pattern the background kind pills use. The

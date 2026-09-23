@@ -48,8 +48,15 @@ def valid_scene():
         # the default scene must not depend on any staged media file.
         "background": {"kind": "color", "color": "#102030"},
         "overlays": [
-            {"kind": "text", "text": "hi", "x": 0.5, "y": 0.5, "size": 0.1,
-             "rotation": 0, "color": "#ffffff"}
+            {
+                "kind": "text",
+                "text": "hi",
+                "x": 0.5,
+                "y": 0.5,
+                "size": 0.1,
+                "rotation": 0,
+                "color": "#ffffff",
+            }
         ],
     }
 
@@ -78,8 +85,14 @@ def expect_reject(envelope, field, reason="invalid_request"):
 
 
 def gpu_overlay():
-    return {"kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1,
-            "rotation": 0, "color": "#ffffff"}
+    return {
+        "kind": "gpu-temp",
+        "x": 0.5,
+        "y": 0.5,
+        "size": 0.1,
+        "rotation": 0,
+        "color": "#ffffff",
+    }
 
 
 def test_preview_request_round_trip() -> None:
@@ -149,7 +162,9 @@ def test_preview_request_rejects_overlays_cap() -> None:
     expect_reject(over, "overlays")
     at_cap = request_envelope()
     at_cap["scene"]["overlays"] = [gpu_overlay() for _ in range(32)]
-    assert validate_preview_request(at_cap)["scene"]["overlays"][0]["kind"] == "gpu-temp"
+    assert (
+        validate_preview_request(at_cap)["scene"]["overlays"][0]["kind"] == "gpu-temp"
+    )
 
 
 def test_preview_request_rejects_traversal_and_nul_source() -> None:
@@ -159,7 +174,11 @@ def test_preview_request_rejects_traversal_and_nul_source() -> None:
     posix["scene"]["background"] = {"kind": "image", "source": "a/../b.png", **MEDIA}
     expect_reject(posix, "background.source")
     windows = request_envelope()
-    windows["scene"]["background"] = {"kind": "video", "source": "..\\evil.png", **MEDIA}
+    windows["scene"]["background"] = {
+        "kind": "video",
+        "source": "..\\evil.png",
+        **MEDIA,
+    }
     expect_reject(windows, "background.source")
     nul = request_envelope()
     nul["scene"]["background"] = {"kind": "gif", "source": "a\x00b", **MEDIA}
@@ -288,12 +307,12 @@ def materialize(entry):
 
 
 def test_scene_corpus_lockstep_with_hardening() -> None:
-    """Pin the Python copy of validateScene to the SAME 42-shape corpus that
+    """Pin the Python copy of validateScene to the SAME 49-shape corpus that
     pins src/hardening.js validateScene and the renderer's isScene. A rule
     change on either side then fails a suite instead of drifting silently."""
     with open(FIXTURES, encoding="utf-8") as handle:
         shapes = json.load(handle)["shapes"]
-    assert len(shapes) == 42, len(shapes)
+    assert len(shapes) == 49, len(shapes)
 
     mismatches = []
     for entry in shapes:
@@ -302,7 +321,9 @@ def test_scene_corpus_lockstep_with_hardening() -> None:
             validate_scene(materialize(entry))
         except ProtocolError as exc:
             if entry["expect"] != "invalid":
-                mismatches.append(f"{name}: rejected (field={exc.field!r}) but corpus says valid")
+                mismatches.append(
+                    f"{name}: rejected (field={exc.field!r}) but corpus says valid"
+                )
                 continue
             if exc.field != entry.get("field"):
                 mismatches.append(
@@ -312,13 +333,16 @@ def test_scene_corpus_lockstep_with_hardening() -> None:
                 mismatches.append(f"{name}: reason {exc.reason!r} != 'invalid_request'")
         else:
             if entry["expect"] != "valid":
-                mismatches.append(f"{name}: accepted but corpus says invalid field={entry.get('field')!r}")
+                mismatches.append(
+                    f"{name}: accepted but corpus says invalid field={entry.get('field')!r}"
+                )
     assert mismatches == [], mismatches
 
 
 # --------------------------------------------------------------------------
 # Overlay text length gate (S2-T8c): validation-time, typed reason
 # --------------------------------------------------------------------------
+
 
 def scene_with_text(text):
     scene = valid_scene()

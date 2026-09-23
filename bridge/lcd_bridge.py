@@ -103,6 +103,7 @@ class DeviceUnavailableError(Exception):
 # Pure helpers (unit-tested, no USB/PIL side effects except where noted)
 # --------------------------------------------------------------------------
 
+
 def clamp_fps(raw: Any, default: int = DEFAULT_FPS) -> int:
     """Clamp an lcdFps setting into [5, 30]; garbage -> default (10)."""
     try:
@@ -390,7 +391,9 @@ def _render_preview_response(request: Dict[str, Any]) -> Dict[str, Any]:
     if Image is None:
         # The one genuinely unrenderable condition left after S1-T6: the
         # Pillow renderer binary itself is absent. The happy path renders.
-        return build_preview_error(req_id, "preview_unavailable", PREVIEW_UNAVAILABLE_MESSAGE)
+        return build_preview_error(
+            req_id, "preview_unavailable", PREVIEW_UNAVAILABLE_MESSAGE
+        )
     size = preview_size(request["maxWidth"], request["maxHeight"])
     try:
         # frame_index: the envelope carries NO frame selector
@@ -413,7 +416,9 @@ def _render_preview_response(request: Dict[str, Any]) -> Dict[str, Any]:
         # route_stdin_line (validation already ran) but still typed.
         return build_preview_error(req_id, exc.reason, exc.message, exc.field)
     except Exception as exc:  # total contract: no traceback may escape
-        return build_preview_error(req_id, "render_failed", f"preview render failed: {exc}")
+        return build_preview_error(
+            req_id, "render_failed", f"preview render failed: {exc}"
+        )
     if len(encoded) > PREVIEW_MAX_BASE64_CHARS:
         # Payload cap BEFORE emit: the preview shares the JSONL pipe with
         # playback state, so an over-cap line is refused as a typed error
@@ -464,7 +469,10 @@ def route_stdin_line(line: str) -> Optional[Tuple[str, Any, Any]]:
         try:
             request = validate_preview_request(payload)
         except ProtocolError as exc:
-            return ("reply", build_preview_error(req_id, exc.reason, exc.message, exc.field))
+            return (
+                "reply",
+                build_preview_error(req_id, exc.reason, exc.message, exc.field),
+            )
         # S1-T6: a valid request renders to a real reduced-resolution PNG
         # through the SAME render_scene() the panel will use (S1-T7).
         return ("reply", _render_preview_response(request))
@@ -482,12 +490,19 @@ def route_stdin_line(line: str) -> Optional[Tuple[str, Any, Any]]:
         # parse_state_line already declined it: known cmd, unusable payload.
         return (
             "reply",
-            build_protocol_error("invalid_request", "state envelope must carry a state object"),
+            build_protocol_error(
+                "invalid_request", "state envelope must carry a state object"
+            ),
         )
-    return ("reply", build_protocol_error("unknown_cmd", f"unknown message type: {discriminator!r}"))
+    return (
+        "reply",
+        build_protocol_error("unknown_cmd", f"unknown message type: {discriminator!r}"),
+    )
 
 
-def extract_display(state: Dict[str, Any], now_ms: Optional[float] = None) -> Dict[str, Any]:
+def extract_display(
+    state: Dict[str, Any], now_ms: Optional[float] = None
+) -> Dict[str, Any]:
     """Flatten a state dict into render fields (tolerates old shapes).
 
     ``progressMs`` is extrapolated via :func:`current_progress` so the bar
@@ -521,10 +536,12 @@ def extract_display(state: Dict[str, Any], now_ms: Optional[float] = None) -> Di
                             active = i
                     except (TypeError, ValueError):
                         pass
+
             def _text(i: int) -> str:
                 if 0 <= i < len(items) and isinstance(items[i], dict):
                     return str(items[i].get("text") or "")
                 return ""
+
             current = _text(active)
             if not nxt:
                 nxt = _text(active + 1)
@@ -544,7 +561,9 @@ def extract_display(state: Dict[str, Any], now_ms: Optional[float] = None) -> Di
     is_playing = bool(state.get("isPlaying", track.get("isPlaying", False)))
 
     album = str(track.get("album") or state.get("album") or "")
-    artwork = track.get("artworkUrl", track.get("artwork_url", state.get("artworkUrl", "")))
+    artwork = track.get(
+        "artworkUrl", track.get("artwork_url", state.get("artworkUrl", ""))
+    )
     artwork_url = artwork if isinstance(artwork, str) else ""
 
     return {
@@ -685,11 +704,15 @@ def render_lyrics(
     artist_font = load_font(22, bold=False)
     margin = 28
     max_w = w - 2 * margin
-    for i, line in enumerate(wrap_text(draw, model["title"], title_font, max_w, limit=2)):
+    for i, line in enumerate(
+        wrap_text(draw, model["title"], title_font, max_w, limit=2)
+    ):
         draw.text((margin, 26 + i * 40), line, font=title_font, fill=(245, 247, 250))
     artist = model["artist"] or " "
     for i, line in enumerate(wrap_text(draw, artist, artist_font, max_w, limit=1)):
-        draw.text((margin, 26 + 2 * 40 + i * 30), line, font=artist_font, fill=(150, 160, 175))
+        draw.text(
+            (margin, 26 + 2 * 40 + i * 30), line, font=artist_font, fill=(150, 160, 175)
+        )
     draw.line([(margin, 150), (w - margin, 150)], fill=(40, 48, 62), width=2)
 
     # Lyrics: current big centered, next attenuated.
@@ -704,8 +727,10 @@ def render_lyrics(
             current_lines.extend(wrap_text(draw, para, current_font, max_w, limit=4))
         current_lines = current_lines[:4]
         widest = max(
-            (draw.textbbox((0, 0), ln, font=current_font)[2]
-             - draw.textbbox((0, 0), ln, font=current_font)[0])
+            (
+                draw.textbbox((0, 0), ln, font=current_font)[2]
+                - draw.textbbox((0, 0), ln, font=current_font)[0]
+            )
             for ln in current_lines
         )
         if widest <= max_w:
@@ -716,34 +741,49 @@ def render_lyrics(
     for i, ln in enumerate(current_lines):
         bbox = draw.textbbox((0, 0), ln, font=current_font)
         tw = bbox[2] - bbox[0]
-        draw.text(((w - tw) / 2, top + i * line_h), ln, font=current_font,
-                  fill=(255, 255, 255))
+        draw.text(
+            ((w - tw) / 2, top + i * line_h),
+            ln,
+            font=current_font,
+            fill=(255, 255, 255),
+        )
     if model["next"]:
         nxt_lines = wrap_text(draw, model["next"], next_font, max_w, limit=2)[:2]
         ny = top + len(current_lines) * line_h + 24
         for i, ln in enumerate(nxt_lines):
             bbox = draw.textbbox((0, 0), ln, font=next_font)
             tw = bbox[2] - bbox[0]
-            draw.text(((w - tw) / 2, ny + i * 36), ln, font=next_font,
-                      fill=(130, 140, 155))
+            draw.text(
+                ((w - tw) / 2, ny + i * 36), ln, font=next_font, fill=(130, 140, 155)
+            )
 
     # Progress bar (bottom) + LV-09 time text. Unknown duration -> empty track.
     bar_w, bar_h = w - 2 * margin, 8
     bar_y = h - 56
-    draw.rounded_rectangle([margin, bar_y, margin + bar_w, bar_y + bar_h],
-                           radius=4, fill=(35, 42, 55))
+    draw.rounded_rectangle(
+        [margin, bar_y, margin + bar_w, bar_y + bar_h], radius=4, fill=(35, 42, 55)
+    )
     if model["durationMs"] > 0:
         frac = min(1.0, max(0.0, model["progressMs"] / model["durationMs"]))
         if frac > 0:
-            draw.rounded_rectangle([margin, bar_y, margin + int(bar_w * frac), bar_y + bar_h],
-                                   radius=4, fill=(88, 166, 255))
+            draw.rounded_rectangle(
+                [margin, bar_y, margin + int(bar_w * frac), bar_y + bar_h],
+                radius=4,
+                fill=(88, 166, 255),
+            )
     status = "▶" if model["isPlaying"] else "❚❚"
     small = load_font(18, bold=False)
     draw.text((margin, bar_y + 16), status, font=small, fill=(120, 130, 145))
-    time_str = f'{format_time(model["progressMs"])} / {format_time(model["durationMs"])}'
+    time_str = (
+        f"{format_time(model['progressMs'])} / {format_time(model['durationMs'])}"
+    )
     tb = draw.textbbox((0, 0), time_str, font=small)
-    draw.text((w - margin - (tb[2] - tb[0]), bar_y + 16), time_str,
-              font=small, fill=(120, 130, 145))
+    draw.text(
+        (w - margin - (tb[2] - tb[0]), bar_y + 16),
+        time_str,
+        font=small,
+        fill=(120, 130, 145),
+    )
 
     return img
 
@@ -773,10 +813,14 @@ def render_cover(
     art_size = max_w
     art_x, art_y = margin, 28
 
-    art = fetch_artwork(model.get("artworkUrl", "")) if model.get("artworkUrl") else None
+    art = (
+        fetch_artwork(model.get("artworkUrl", "")) if model.get("artworkUrl") else None
+    )
     if art is not None:
         try:
-            square = _center_crop_square(art).resize((art_size, art_size), Image.LANCZOS)
+            square = _center_crop_square(art).resize(
+                (art_size, art_size), Image.LANCZOS
+            )
             img.paste(square, (art_x, art_y))
         except Exception:
             art = None
@@ -793,34 +837,54 @@ def render_cover(
             outline=(40, 48, 62),
             width=2,
         )
-        draw_note_icon(draw, art_x + art_size // 2, art_y + art_size // 2, art_size // 3)
+        draw_note_icon(
+            draw, art_x + art_size // 2, art_y + art_size // 2, art_size // 3
+        )
 
     # Title / artist / album below the art.
     title_font = load_font(30, bold=True)
     artist_font = load_font(22, bold=False)
     album_font = load_font(20, bold=False)
     text_top = art_y + art_size + 22
-    for i, line in enumerate(wrap_text(draw, model["title"], title_font, max_w, limit=2)):
-        draw.text((margin, text_top + i * 38), line, font=title_font, fill=(245, 247, 250))
+    for i, line in enumerate(
+        wrap_text(draw, model["title"], title_font, max_w, limit=2)
+    ):
+        draw.text(
+            (margin, text_top + i * 38), line, font=title_font, fill=(245, 247, 250)
+        )
     artist = model["artist"] or " "
     for i, line in enumerate(wrap_text(draw, artist, artist_font, max_w, limit=1)):
-        draw.text((margin, text_top + 2 * 38 + i * 30), line, font=artist_font,
-                  fill=(150, 160, 175))
+        draw.text(
+            (margin, text_top + 2 * 38 + i * 30),
+            line,
+            font=artist_font,
+            fill=(150, 160, 175),
+        )
     if model.get("album"):
-        for i, line in enumerate(wrap_text(draw, model["album"], album_font, max_w, limit=1)):
-            draw.text((margin, text_top + 2 * 38 + 30 + i * 28), line, font=album_font,
-                      fill=(120, 130, 145))
+        for i, line in enumerate(
+            wrap_text(draw, model["album"], album_font, max_w, limit=1)
+        ):
+            draw.text(
+                (margin, text_top + 2 * 38 + 30 + i * 28),
+                line,
+                font=album_font,
+                fill=(120, 130, 145),
+            )
 
     # Progress bar + drawn icon + m:ss / m:ss time (bottom).
     bar_w, bar_h = w - 2 * margin, 8
     bar_y = h - 56
-    draw.rounded_rectangle([margin, bar_y, margin + bar_w, bar_y + bar_h],
-                           radius=4, fill=(35, 42, 55))
+    draw.rounded_rectangle(
+        [margin, bar_y, margin + bar_w, bar_y + bar_h], radius=4, fill=(35, 42, 55)
+    )
     if model["durationMs"] > 0:
         frac = min(1.0, max(0.0, model["progressMs"] / model["durationMs"]))
         if frac > 0:
-            draw.rounded_rectangle([margin, bar_y, margin + int(bar_w * frac), bar_y + bar_h],
-                                   radius=4, fill=(88, 166, 255))
+            draw.rounded_rectangle(
+                [margin, bar_y, margin + int(bar_w * frac), bar_y + bar_h],
+                radius=4,
+                fill=(88, 166, 255),
+            )
     icon_size = 22
     icon_y = bar_y + 16
     if model["isPlaying"]:
@@ -828,12 +892,37 @@ def render_cover(
     else:
         draw_pause_icon(draw, margin, icon_y, icon_size)
     small = load_font(20, bold=False)
-    time_str = f'{format_time(model["progressMs"])} / {format_time(model["durationMs"])}'
+    time_str = (
+        f"{format_time(model['progressMs'])} / {format_time(model['durationMs'])}"
+    )
     tb = draw.textbbox((0, 0), time_str, font=small)
-    draw.text((w - margin - (tb[2] - tb[0]), icon_y - 2), time_str,
-              font=small, fill=(150, 160, 175))
+    draw.text(
+        (w - margin - (tb[2] - tb[0]), icon_y - 2),
+        time_str,
+        font=small,
+        fill=(150, 160, 175),
+    )
 
     return img
+
+
+def _draw_centered_text_lines(
+    draw, lines, font, center_x, top, line_step, fill
+) -> None:
+    """Draw already-wrapped lines around one normalized center anchor."""
+    for index, line in enumerate(lines):
+        bbox = draw.textbbox((0, 0), line, font=font)
+        width = bbox[2] - bbox[0]
+        draw.text(
+            (round(center_x - width / 2), top + index * line_step),
+            line,
+            font=font,
+            fill=fill,
+        )
+
+
+def _base_font_size(placement: Dict[str, Any], canvas_height: int) -> int:
+    return max(1, round(placement["size"] * canvas_height))
 
 
 def render_unified(
@@ -841,6 +930,7 @@ def render_unified(
     glass: Tuple[int, int] = DEFAULT_GLASS,
     now_ms: Optional[float] = None,
     base=None,
+    base_placements: Optional[Dict[str, Dict[str, Any]]] = None,
 ):
     """Render the UNIFIED single view (LV-09 producto: el unico modo).
 
@@ -857,11 +947,22 @@ def render_unified(
     the wrong mode or size is IGNORED and a fresh canvas is built instead
     -- fail-safe on the production path: the view the panel shows must
     never depend on a compatibility check passing.
+
+    ``base_placements`` is the already-validated optional S7-T24a map. Each
+    x/y is a center anchor in portrait glass space. Cover/progress size is a
+    fraction of portrait width; text size is a fraction of portrait height.
+    An absent key (or an absent map) runs the exact legacy geometry branch.
     """
     if Image is None:
         raise RuntimeError("Pillow is required for rendering (pip install Pillow)")
     w, h = glass
     model = extract_display(state, now_ms)
+    placements = base_placements or {}
+    cover_placement = placements.get("cover")
+    title_placement = placements.get("title")
+    artist_placement = placements.get("artist")
+    lyrics_placement = placements.get("lyrics")
+    progress_placement = placements.get("progress")
 
     if (
         base is not None
@@ -878,13 +979,25 @@ def render_unified(
     # Art on top: 320px centered (leaves room for lyrics below; full-bleed
     # 424px left no vertical space for current+next). Same LRU/fetch path
     # as the legacy cover layout.
-    art_size = 320
-    art_x = margin + (max_w - art_size) // 2
-    art_y = 24
-    art = fetch_artwork(model.get("artworkUrl", "")) if model.get("artworkUrl") else None
+    legacy_art_size = 320
+    legacy_art_x = margin + (max_w - legacy_art_size) // 2
+    legacy_art_y = 24
+    if cover_placement is not None:
+        art_size = max(1, round(cover_placement["size"] * w))
+        art_x = round(cover_placement["x"] * w - art_size / 2)
+        art_y = round(cover_placement["y"] * h - art_size / 2)
+    else:
+        art_size = legacy_art_size
+        art_x = legacy_art_x
+        art_y = legacy_art_y
+    art = (
+        fetch_artwork(model.get("artworkUrl", "")) if model.get("artworkUrl") else None
+    )
     if art is not None:
         try:
-            square = _center_crop_square(art).resize((art_size, art_size), Image.LANCZOS)
+            square = _center_crop_square(art).resize(
+                (art_size, art_size), Image.LANCZOS
+            )
             img.paste(square, (art_x, art_y))
         except Exception:
             art = None
@@ -900,80 +1013,246 @@ def render_unified(
             outline=(40, 48, 62),
             width=2,
         )
-        draw_note_icon(draw, art_x + art_size // 2, art_y + art_size // 2, art_size // 3)
+        draw_note_icon(
+            draw, art_x + art_size // 2, art_y + art_size // 2, art_size // 3
+        )
 
-    # Title / artist / album below the art.
-    title_font = load_font(28, bold=True)
-    artist_font = load_font(22, bold=False)
-    album_font = load_font(20, bold=False)
-    text_top = art_y + art_size + 16
-    for i, line in enumerate(wrap_text(draw, model["title"], title_font, max_w, limit=2)):
-        draw.text((margin, text_top + i * 36), line, font=title_font, fill=(245, 247, 250))
+    # Title / artist / album below the art. Legacy branches are intentionally
+    # untouched so a missing override keeps the pre-S7-T24a pixels byte-exact.
+    text_top = legacy_art_y + legacy_art_size + 16
+    if title_placement is None:
+        title_font = load_font(28, bold=True)
+        for i, line in enumerate(
+            wrap_text(draw, model["title"], title_font, max_w, limit=2)
+        ):
+            draw.text(
+                (margin, text_top + i * 36),
+                line,
+                font=title_font,
+                fill=(245, 247, 250),
+            )
+    else:
+        title_size = _base_font_size(title_placement, h)
+        title_font = load_font(title_size, bold=True)
+        title_lines = wrap_text(draw, model["title"], title_font, max_w, limit=2)
+        title_step = title_size + 8
+        title_top = round(
+            title_placement["y"] * h
+            - (title_size + (len(title_lines) - 1) * title_step) / 2
+        )
+        _draw_centered_text_lines(
+            draw,
+            title_lines,
+            title_font,
+            title_placement["x"] * w,
+            title_top,
+            title_step,
+            (245, 247, 250),
+        )
+
     artist = model["artist"] or " "
-    for i, line in enumerate(wrap_text(draw, artist, artist_font, max_w, limit=1)):
-        draw.text((margin, text_top + 2 * 36 + i * 28), line, font=artist_font,
-                  fill=(150, 160, 175))
-    if model.get("album"):
-        for i, line in enumerate(wrap_text(draw, model["album"], album_font, max_w, limit=1)):
-            draw.text((margin, text_top + 2 * 36 + 28 + i * 26), line, font=album_font,
-                      fill=(120, 130, 145))
+    if artist_placement is None:
+        artist_font = load_font(22, bold=False)
+        album_font = load_font(20, bold=False)
+        for i, line in enumerate(wrap_text(draw, artist, artist_font, max_w, limit=1)):
+            draw.text(
+                (margin, text_top + 2 * 36 + i * 28),
+                line,
+                font=artist_font,
+                fill=(150, 160, 175),
+            )
+        if model.get("album"):
+            for i, line in enumerate(
+                wrap_text(draw, model["album"], album_font, max_w, limit=1)
+            ):
+                draw.text(
+                    (margin, text_top + 2 * 36 + 28 + i * 26),
+                    line,
+                    font=album_font,
+                    fill=(120, 130, 145),
+                )
+    else:
+        artist_size = _base_font_size(artist_placement, h)
+        artist_font = load_font(artist_size, bold=False)
+        artist_lines = wrap_text(draw, artist, artist_font, max_w, limit=1)
+        artist_step = artist_size + 8
+        album_lines = (
+            wrap_text(
+                draw,
+                model["album"],
+                load_font(max(1, round(artist_size * 20 / 22)), bold=False),
+                max_w,
+                limit=1,
+            )
+            if model.get("album")
+            else []
+        )
+        album_step = max(1, round(artist_size * 20 / 22)) + 6
+        block_height = artist_size + (album_step if album_lines else 0)
+        artist_top = round(artist_placement["y"] * h - block_height / 2)
+        _draw_centered_text_lines(
+            draw,
+            artist_lines,
+            artist_font,
+            artist_placement["x"] * w,
+            artist_top,
+            artist_step,
+            (150, 160, 175),
+        )
+        if album_lines:
+            _draw_centered_text_lines(
+                draw,
+                album_lines,
+                load_font(max(1, round(artist_size * 20 / 22)), bold=False),
+                artist_placement["x"] * w,
+                artist_top + artist_step,
+                album_step,
+                (120, 130, 145),
+            )
 
     # Current line (+ next attenuated), centered in the middle band.
-    current_font = load_font(34, bold=True)
-    next_font = load_font(24, bold=False)
-    current_lines: list[str] = []
-    size = 34
-    for size in range(34, 21, -2):
-        current_font = load_font(size, bold=True)
-        current_lines = []
-        for para in (model["current"] or "♪").split("\n"):
-            current_lines.extend(wrap_text(draw, para, current_font, max_w, limit=3))
-        current_lines = current_lines[:3]
-        widest = max(
-            (draw.textbbox((0, 0), ln, font=current_font)[2]
-             - draw.textbbox((0, 0), ln, font=current_font)[0])
-            for ln in current_lines
-        )
-        if widest <= max_w:
-            break
-    lyrics_top = text_top + 2 * 36 + 28 + 30
-    line_h = size + 10
-    for i, ln in enumerate(current_lines):
-        bbox = draw.textbbox((0, 0), ln, font=current_font)
-        tw = bbox[2] - bbox[0]
-        draw.text(((w - tw) / 2, lyrics_top + i * line_h), ln, font=current_font,
-                  fill=(255, 255, 255))
-    if model["next"]:
-        nxt_lines = wrap_text(draw, model["next"], next_font, max_w, limit=2)[:2]
-        ny = lyrics_top + len(current_lines) * line_h + 14
-        for i, ln in enumerate(nxt_lines):
-            bbox = draw.textbbox((0, 0), ln, font=next_font)
+    if lyrics_placement is None:
+        current_font = load_font(34, bold=True)
+        next_font = load_font(24, bold=False)
+        current_lines: list[str] = []
+        size = 34
+        for size in range(34, 21, -2):
+            current_font = load_font(size, bold=True)
+            current_lines = []
+            for para in (model["current"] or "♪").split("\n"):
+                current_lines.extend(
+                    wrap_text(draw, para, current_font, max_w, limit=3)
+                )
+            current_lines = current_lines[:3]
+            widest = max(
+                (
+                    draw.textbbox((0, 0), ln, font=current_font)[2]
+                    - draw.textbbox((0, 0), ln, font=current_font)[0]
+                )
+                for ln in current_lines
+            )
+            if widest <= max_w:
+                break
+        lyrics_top = text_top + 2 * 36 + 28 + 30
+        line_h = size + 10
+        for i, ln in enumerate(current_lines):
+            bbox = draw.textbbox((0, 0), ln, font=current_font)
             tw = bbox[2] - bbox[0]
-            draw.text(((w - tw) / 2, ny + i * 32), ln, font=next_font,
-                      fill=(130, 140, 155))
+            draw.text(
+                ((w - tw) / 2, lyrics_top + i * line_h),
+                ln,
+                font=current_font,
+                fill=(255, 255, 255),
+            )
+        if model["next"]:
+            nxt_lines = wrap_text(draw, model["next"], next_font, max_w, limit=2)[:2]
+            ny = lyrics_top + len(current_lines) * line_h + 14
+            for i, ln in enumerate(nxt_lines):
+                bbox = draw.textbbox((0, 0), ln, font=next_font)
+                tw = bbox[2] - bbox[0]
+                draw.text(
+                    ((w - tw) / 2, ny + i * 32),
+                    ln,
+                    font=next_font,
+                    fill=(130, 140, 155),
+                )
+    else:
+        max_font_size = _base_font_size(lyrics_placement, h)
+        min_font_size = max(1, round(max_font_size * 22 / 34))
+        current_lines = []
+        for size in range(max_font_size, min_font_size - 1, -2):
+            current_font = load_font(size, bold=True)
+            current_lines = []
+            for para in (model["current"] or "♪").split("\n"):
+                current_lines.extend(
+                    wrap_text(draw, para, current_font, max_w, limit=3)
+                )
+            current_lines = current_lines[:3]
+            widest = max(
+                draw.textbbox((0, 0), line, font=current_font)[2]
+                - draw.textbbox((0, 0), line, font=current_font)[0]
+                for line in current_lines
+            )
+            if widest <= max_w:
+                break
+        next_size = max(1, round(size * 24 / 34))
+        next_font = load_font(next_size, bold=False)
+        next_lines = (
+            wrap_text(draw, model["next"], next_font, max_w, limit=2)[:2]
+            if model["next"]
+            else []
+        )
+        line_h = size + 10
+        next_step = next_size + 8
+        next_gap = 14 if next_lines else 0
+        block_height = (
+            size
+            + (len(current_lines) - 1) * line_h
+            + next_gap
+            + (next_size + (len(next_lines) - 1) * next_step if next_lines else 0)
+        )
+        lyrics_top = round(lyrics_placement["y"] * h - block_height / 2)
+        _draw_centered_text_lines(
+            draw,
+            current_lines,
+            current_font,
+            lyrics_placement["x"] * w,
+            lyrics_top,
+            line_h,
+            (255, 255, 255),
+        )
+        if next_lines:
+            _draw_centered_text_lines(
+                draw,
+                next_lines,
+                next_font,
+                lyrics_placement["x"] * w,
+                lyrics_top + len(current_lines) * line_h + next_gap,
+                next_step,
+                (130, 140, 155),
+            )
 
     # Progress bar + drawn icon + m:ss / m:ss time (bottom). Unknown
     # duration -> empty track (total 0:00), same rule as legacy layouts.
-    bar_w, bar_h = w - 2 * margin, 8
-    bar_y = h - 56
-    draw.rounded_rectangle([margin, bar_y, margin + bar_w, bar_y + bar_h],
-                           radius=4, fill=(35, 42, 55))
+    bar_h = 8
+    if progress_placement is None:
+        bar_x = margin
+        bar_w = w - 2 * margin
+        bar_y = h - 56
+    else:
+        bar_w = max(1, round(progress_placement["size"] * w))
+        bar_x = round(progress_placement["x"] * w - bar_w / 2)
+        bar_y = round(progress_placement["y"] * h - bar_h / 2)
+    draw.rounded_rectangle(
+        [bar_x, bar_y, bar_x + bar_w, bar_y + bar_h],
+        radius=4,
+        fill=(35, 42, 55),
+    )
     if model["durationMs"] > 0:
         frac = min(1.0, max(0.0, model["progressMs"] / model["durationMs"]))
         if frac > 0:
-            draw.rounded_rectangle([margin, bar_y, margin + int(bar_w * frac), bar_y + bar_h],
-                                   radius=4, fill=(88, 166, 255))
+            draw.rounded_rectangle(
+                [bar_x, bar_y, bar_x + int(bar_w * frac), bar_y + bar_h],
+                radius=4,
+                fill=(88, 166, 255),
+            )
     icon_size = 22
     icon_y = bar_y + 16
     if model["isPlaying"]:
-        draw_play_icon(draw, margin, icon_y, icon_size)
+        draw_play_icon(draw, bar_x, icon_y, icon_size)
     else:
-        draw_pause_icon(draw, margin, icon_y, icon_size)
+        draw_pause_icon(draw, bar_x, icon_y, icon_size)
     small = load_font(20, bold=False)
-    time_str = f'{format_time(model["progressMs"])} / {format_time(model["durationMs"])}'
+    time_str = (
+        f"{format_time(model['progressMs'])} / {format_time(model['durationMs'])}"
+    )
     tb = draw.textbbox((0, 0), time_str, font=small)
-    draw.text((w - margin - (tb[2] - tb[0]), icon_y - 2), time_str,
-              font=small, fill=(150, 160, 175))
+    draw.text(
+        (bar_x + bar_w - (tb[2] - tb[0]), icon_y - 2),
+        time_str,
+        font=small,
+        fill=(150, 160, 175),
+    )
 
     return img
 
@@ -1321,7 +1600,9 @@ def _resolve_media_source(source: str, media_root: Any) -> str:
     return candidate
 
 
-def _load_media_bytes(source: str, media_root: Any, *, max_bytes: Optional[int] = None) -> bytes:
+def _load_media_bytes(
+    source: str, media_root: Any, *, max_bytes: Optional[int] = None
+) -> bytes:
     """Inline data: URL bytes, or a contained read from the media root.
 
     ``max_bytes`` (GIF payloads, S1-T5): for filesystem keys the cap is
@@ -1544,9 +1825,7 @@ def _require_canvas_size(size) -> None:
     if not (
         isinstance(size, tuple)
         and len(size) == 2
-        and all(
-            isinstance(v, int) and not isinstance(v, bool) and v > 0 for v in size
-        )
+        and all(isinstance(v, int) and not isinstance(v, bool) and v > 0 for v in size)
     ):
         raise ValueError("size must be a (width, height) tuple of positive ints")
 
@@ -1558,7 +1837,10 @@ def _paint_scene_background(canvas, validated, media_root, frame_index) -> None:
     if kind == "none":
         pass  # a transparent canvas IS the background
     elif kind == "color":
-        canvas.paste(_hex_rgb(background["color"]) + (255,), (0, 0, canvas.size[0], canvas.size[1]))
+        canvas.paste(
+            _hex_rgb(background["color"]) + (255,),
+            (0, 0, canvas.size[0], canvas.size[1]),
+        )
     elif kind == "image":
         _render_image_background(canvas, background, media_root)
     elif kind == "gif":
@@ -1586,13 +1868,14 @@ def _paint_scene_overlays(canvas, validated) -> None:
             # not given; valid shape, unimplementable here.
             raise SceneRenderError(
                 "unsupported_overlay",
-                f"overlay kind {overlay_kind!r} is not supported by "
-                "render_scene yet",
+                f"overlay kind {overlay_kind!r} is not supported by render_scene yet",
                 field=f"overlays[{index}].kind",
             )
 
 
-def render_scene_background(scene, *, media_root, size=(480, 854), frame_index: int = 0):
+def render_scene_background(
+    scene, *, media_root, size=(480, 854), frame_index: int = 0
+):
     """Background-only RGBA layer -- render_scene minus its overlay pass (S1-T7a).
 
     Same validation, same frame selector, same paint code as render_scene,
@@ -1702,8 +1985,7 @@ def _open_gif(payload: bytes, source: str):
         handle.close()
         raise SceneRenderError(
             "media_too_large",
-            f"GIF has {count} frames, over the {SCENE_MAX_GIF_FRAMES} cap: "
-            f"{source!r}",
+            f"GIF has {count} frames, over the {SCENE_MAX_GIF_FRAMES} cap: {source!r}",
             field="background.source",
         )
     return handle, count
@@ -1952,8 +2234,7 @@ def gif_frame_index_at(scene, media_root, now_ms=None) -> int:
         coerced = _finite_float(now_ms)
         now = 0.0 if coerced is None else coerced
     source = validated["background"]["source"]
-    payload = _load_media_bytes(source, media_root,
-                                max_bytes=SCENE_MAX_GIF_BYTES)
+    payload = _load_media_bytes(source, media_root, max_bytes=SCENE_MAX_GIF_BYTES)
     handle, count = _open_gif(payload, source)
     try:
         delays = _gif_delays(handle, count, source)
@@ -2021,7 +2302,13 @@ def render_frame(
     base = Image.alpha_composite(
         Image.new("RGBA", (w, h), (10, 13, 20) + (255,)), background
     ).convert("RGB")
-    view = render_unified(state, glass, now_ms, base=base)
+    view = render_unified(
+        state,
+        glass,
+        now_ms,
+        base=base,
+        base_placements=scene.get("basePlacements"),
+    )
     # Presence probe only (cheap short-circuit for the common empty case);
     # draw_scene_overlays re-validates authoritatively below. By here the
     # scene is known-dict-valid (render_scene_background validated it).
@@ -2066,9 +2353,7 @@ def display_state_digest(state, *, now_ms=None) -> str:
     """
     model = extract_display(state, now_ms)
     track = state.get("track") if isinstance(state.get("track"), dict) else {}
-    settings = (
-        state.get("settings") if isinstance(state.get("settings"), dict) else {}
-    )
+    settings = state.get("settings") if isinstance(state.get("settings"), dict) else {}
     subset = {
         # What the lyrics view paints (extract_display's output):
         "title": model["title"],
@@ -2088,8 +2373,7 @@ def display_state_digest(state, *, now_ms=None) -> str:
         # Stream cadence:
         "lcdFps": settings.get("lcdFps"),
     }
-    canonical = json.dumps(subset, sort_keys=True, separators=(",", ":"),
-                           default=str)
+    canonical = json.dumps(subset, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -2304,8 +2588,7 @@ class FramePacer:
             self._seq = seq
             self._ack_owed = True
 
-    def plan(self, state, scene, *, now_ms, fps,
-             media_root=MEDIA_ROOT) -> FramePlan:
+    def plan(self, state, scene, *, now_ms, fps, media_root=MEDIA_ROOT) -> FramePlan:
         """Decide one iteration: wait, dirty flag, ack routing.
 
         ACK CONTRACT (keeps tests/test_shell_spawn.js's exact-3-acks
@@ -2323,14 +2606,18 @@ class FramePacer:
             # frame_index must be the SAME selector render_portrait will use
             # at the SAME now_ms: key and pixels must describe one frame.
             frame_index = (
-                0 if scene is None
-                else gif_frame_index_at(scene, media_root, now_ms)
+                0 if scene is None else gif_frame_index_at(scene, media_root, now_ms)
             )
-            key = composite_frame_key(state, scene, now_ms=now_ms,
-                                      frame_index=frame_index)
-            refresh_ms = frame_refresh_ms(state, scene, media_root=media_root,
-                                          now_ms=now_ms,
-                                          frame_index=frame_index)
+            key = composite_frame_key(
+                state, scene, now_ms=now_ms, frame_index=frame_index
+            )
+            refresh_ms = frame_refresh_ms(
+                state,
+                scene,
+                media_root=media_root,
+                now_ms=now_ms,
+                frame_index=frame_index,
+            )
         except Exception as exc:
             # Fail-safe DIRECTION (documented decision): an invalid or
             # unreadable scene must NEVER kill the loop. Paint
@@ -2342,13 +2629,23 @@ class FramePacer:
             # every iteration.
             _warn_scene_fallback(exc)
             self.last_key = None
-            return FramePlan(bounded_wait_seconds(fps, None), True,
-                             self._commit_ack(render=True), frame_index, None)
+            return FramePlan(
+                bounded_wait_seconds(fps, None),
+                True,
+                self._commit_ack(render=True),
+                frame_index,
+                None,
+            )
         render = self.force or key != self.last_key  # first plan: paint
         if render:
             self.last_key = key
-        return FramePlan(bounded_wait_seconds(fps, refresh_ms), render,
-                         self._commit_ack(render=render), frame_index, key)
+        return FramePlan(
+            bounded_wait_seconds(fps, refresh_ms),
+            render,
+            self._commit_ack(render=render),
+            frame_index,
+            key,
+        )
 
     def _commit_ack(self, *, render):
         ack = self._ack_owed or (render and self._seq is not None)
@@ -2413,6 +2710,7 @@ def unknown_status(pm: int, sub: int) -> Dict[str, Any]:
 # --------------------------------------------------------------------------
 # USB I/O (thin wrappers so unit tests can mock at the endpoint level)
 # --------------------------------------------------------------------------
+
 
 def _usb_backend():
     try:
@@ -2568,7 +2866,9 @@ def do_handshake(ep_out, ep_in, timeout_ms: int = 2000) -> Tuple[int, int]:
         )
 
 
-def send_frame(ep_out, profile: PanelProfile, jpeg: bytes, timeout_ms: int = 5000) -> None:
+def send_frame(
+    ep_out, profile: PanelProfile, jpeg: bytes, timeout_ms: int = 5000
+) -> None:
     """Send one frame: 64B header (via protocol builder) + JPEG chunks."""
     w, h = profile.buffer_size
     header = build_frame_header(w, h, CMD_FRAME, len(jpeg))
@@ -2582,6 +2882,7 @@ def send_frame(ep_out, profile: PanelProfile, jpeg: bytes, timeout_ms: int = 500
 # --------------------------------------------------------------------------
 # Output helpers (stdout = JSONL for the shell; stderr = human logs)
 # --------------------------------------------------------------------------
+
 
 def emit(obj: Dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
@@ -2624,6 +2925,7 @@ def demo_state(layout: str = "lyrics") -> Dict[str, Any]:
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
+
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
@@ -2674,7 +2976,9 @@ def run_preview(path: str, layout: str = "lyrics") -> int:
     return 0
 
 
-def _stdin_reader(stop: threading.Event, pending: "queue.Queue[Tuple[Optional[int], Dict[str, Any]]]"):
+def _stdin_reader(
+    stop: threading.Event, pending: "queue.Queue[Tuple[Optional[int], Dict[str, Any]]]"
+):
     # Read bytes on purpose: the OS locale encoding on Windows (cp1252)
     # would mangle UTF-8 lyrics, so decode explicitly as UTF-8 here.
     #
@@ -2740,7 +3044,9 @@ def main(argv=None) -> int:
     # envelopes must be queued before frame 1 — otherwise frame 1 renders the
     # default layout and acks nothing, which is what left
     # tests/test_shell_spawn.js with 2 acks for 3 frames.
-    pending: "queue.Queue[Tuple[Optional[int], Dict[str, Any]]]" = queue.Queue(maxsize=30)
+    pending: "queue.Queue[Tuple[Optional[int], Dict[str, Any]]]" = queue.Queue(
+        maxsize=30
+    )
     stop = threading.Event()
     reader = threading.Thread(target=_stdin_reader, args=(stop, pending), daemon=True)
     reader.start()
@@ -2749,8 +3055,15 @@ def main(argv=None) -> int:
     try:
         dev, ep_out, ep_in = open_device(args.serial)
     except DeviceUnavailableError as exc:
-        emit({"type": "status", "status": exc.status,
-              "message": str(exc), "queue": 0, "frames": 0})
+        emit(
+            {
+                "type": "status",
+                "status": exc.status,
+                "message": str(exc),
+                "queue": 0,
+                "frames": 0,
+            }
+        )
         log(f"error: {exc}")
         stop.set()
         return 3
@@ -2758,8 +3071,15 @@ def main(argv=None) -> int:
     try:
         pm, sub = do_handshake(ep_out, ep_in)
     except DeviceUnavailableError as exc:
-        emit({"type": "status", "status": exc.status,
-              "message": str(exc), "queue": 0, "frames": 0})
+        emit(
+            {
+                "type": "status",
+                "status": exc.status,
+                "message": str(exc),
+                "queue": 0,
+                "frames": 0,
+            }
+        )
         log(f"error: {exc}")
         close_device(dev)
         stop.set()
@@ -2775,9 +3095,11 @@ def main(argv=None) -> int:
         return 2
 
     glass = profile.glass_size if profile.glass_size != (0, 0) else DEFAULT_GLASS
-    log(f"panel: {profile.name} (PM={pm} SUB={sub}), "
+    log(
+        f"panel: {profile.name} (PM={pm} SUB={sub}), "
         f"glass {glass[0]}x{glass[1]} -> buffer "
-        f"{profile.buffer_size[0]}x{profile.buffer_size[1]}")
+        f"{profile.buffer_size[0]}x{profile.buffer_size[1]}"
+    )
 
     state: Dict[str, Any] = {}
     # Last VALIDATED scene received. Local to this loop thread (the reader
@@ -2834,21 +3156,41 @@ def main(argv=None) -> int:
             # post-render check below => still ~1 Hz cadence, no spam.
             now = time.monotonic()
             if now - last_status >= STATUS_INTERVAL_S:
-                emit({"type": "status", "panel": profile.name, "pm": pm, "sub": sub,
-                      "fps": fps, "queue": pending.qsize(), "frames": frames})
+                emit(
+                    {
+                        "type": "status",
+                        "panel": profile.name,
+                        "pm": pm,
+                        "sub": sub,
+                        "fps": fps,
+                        "queue": pending.qsize(),
+                        "frames": frames,
+                    }
+                )
                 last_status = now
 
             if plan.render:
-                portrait = render_portrait(state, glass, now_ms=now_ms,
-                                            frame_index=plan.frame_index)
+                portrait = render_portrait(
+                    state, glass, now_ms=now_ms, frame_index=plan.frame_index
+                )
                 buffer_img = portrait_to_buffer(portrait, profile.rotation)
                 jpeg = encode_jpeg(buffer_img)
                 try:
                     send_frame(ep_out, profile, jpeg)
                 except Exception as exc:
-                    emit({"type": "status", "status": "blocked", "panel": profile.name,
-                          "pm": pm, "sub": sub, "fps": fps, "queue": pending.qsize(),
-                          "frames": frames, "message": f"bulk write failed: {exc}"})
+                    emit(
+                        {
+                            "type": "status",
+                            "status": "blocked",
+                            "panel": profile.name,
+                            "pm": pm,
+                            "sub": sub,
+                            "fps": fps,
+                            "queue": pending.qsize(),
+                            "frames": frames,
+                            "message": f"bulk write failed: {exc}",
+                        }
+                    )
                     log(f"error: bulk write failed: {exc}")
                     close_device(dev)
                     return 3
@@ -2864,8 +3206,17 @@ def main(argv=None) -> int:
 
             now = time.monotonic()
             if now - last_status >= STATUS_INTERVAL_S:
-                emit({"type": "status", "panel": profile.name, "pm": pm, "sub": sub,
-                      "fps": fps, "queue": pending.qsize(), "frames": frames})
+                emit(
+                    {
+                        "type": "status",
+                        "panel": profile.name,
+                        "pm": pm,
+                        "sub": sub,
+                        "fps": fps,
+                        "queue": pending.qsize(),
+                        "frames": frames,
+                    }
+                )
                 last_status = now
 
             if args.once is not None and frames >= args.once:

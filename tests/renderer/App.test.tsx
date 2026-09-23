@@ -3,12 +3,46 @@ import { describe, expect, it, vi, type Mock } from 'vitest';
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 
+import './konvaJsdomShims';
 import App from '@/App';
 import type {
   LyricvisionBridge,
   PlayerStatePush,
   StoredSettings,
 } from '@/lib/bridge';
+import type { ReactNode } from 'react';
+
+// motion/react (SceneEditor's panel-swap animation, S7-T19) mocked to a
+// passthrough so jsdom needs no Web Animations API: children render into
+// a plain <div>. Honest coverage — if the wrapper swallowed content, every
+// query below that touches SceneEditor's output would already fail.
+vi.mock('motion/react', () => {
+  type PanelProps = {
+    children?: ReactNode;
+    className?: string;
+    role?: string;
+    'aria-label'?: string;
+    initial?: unknown;
+    animate?: unknown;
+    exit?: unknown;
+    transition?: unknown;
+  };
+  return {
+    AnimatePresence: ({ children }: { children?: ReactNode }) => <>{children}</>,
+    motion: {
+      div: ({
+        children,
+        className,
+        role,
+        'aria-label': ariaLabel,
+      }: PanelProps) => (
+        <div className={className} role={role} aria-label={ariaLabel}>
+          {children}
+        </div>
+      ),
+    },
+  };
+});
 
 type PushFn = (state: PlayerStatePush) => void;
 type AuthFn = (result: { ok: boolean; error?: string }) => void;
@@ -46,6 +80,9 @@ function makeBridge(settings: Partial<StoredSettings> = {}): StubBridge {
     exportDiagnostics: vi.fn(async () => ({ path: 'diag.json' })),
     onPlayerState: vi.fn(() => vi.fn()),
     onSpotifyAuth: vi.fn(() => vi.fn()),
+    // SceneEditor is always mounted now (S7-T19), so App's stub must be
+    // able to answer its debounced preview request like the real preload.
+    previewScene: vi.fn(async () => 'data:image/png;base64,aGVsbG8='),
     importMedia: vi.fn(async () => null),
   };
 }

@@ -3,32 +3,60 @@ import {
   useRef,
   useState,
   useCallback,
-  type PointerEvent as ReactPointerEvent,
+  useMemo,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type ReactNode,
 } from "react";
 
+import { Redo2, Undo2 } from "lucide-react";
+import { AnimatePresence, motion } from "motion/react";
+
+import LayersList from "@/components/LayersList";
+import SceneStage, { type OverlayPlacement } from "@/components/SceneStage";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
+import { ColorPicker } from "@/components/ui/color-picker";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Separator } from "@/components/ui/separator";
+import {
+  BASE_WIDGET_META,
+  resolveBasePlacements,
+  sameBasePlacement,
+} from "@/lib/basePlacements";
 import { errMessage, type LyricvisionBridge } from "@/lib/bridge";
 import {
+  BASE_WIDGET_KEYS,
   SCENE_MAX_TEXT_CHARS,
   SCENE_OVERLAYS_CAP,
   type Background,
+  type BasePlacement,
+  type BaseWidget,
   type MediaBackgroundKind,
   type Scene,
 } from "@/lib/scene";
+import {
+  validateSceneForEditor,
+  validateSceneForModel,
+  type SceneValidationIssue,
+} from "@/lib/sceneSchema";
+import { useCanRedo, useCanUndo, useSceneStore } from "@/lib/sceneStore";
 
 /**
  * Scene editor (S2-T8): WYSIWYG surface whose every committed value is
  * previewed live on the connected panel (scene:preview IPC over the live
  * sidecar pipe) and persisted through saveSettings({scene}).
  *
- * STATE SPLIT (why): the scene lives in App state — it must survive this
- * component unmounting and feeds Save/Reset. Everything else is ephemeral
- * editor UI state kept local on purpose: numeric drafts (typing must not be
- * interrupted by round-trips), overlay selection, preview bytes, and status
- * messages never leak into settings.
+ * STATE SPLIT (why): the scene lives in the Zustand scene store
+ * (S7-T20, src/renderer/lib/sceneStore.ts) — it must survive this
+ * component unmounting and feeds Save/Reset plus undo/redo; App wires the
+ * store into the props below, so this component stays props-driven. The
+ * canvas itself moved to Konva in S7-T21 (src/renderer/components/
+ * SceneStage.tsx). Everything else is ephemeral editor UI state kept local
+ * on purpose: numeric drafts (typing must not be interrupted by
+ * round-trips), overlay selection, the active rail section, preview bytes,
+ * and status messages never leak into settings — and never into undo
+ * history either, which records scene mutations only.
  *
  * MEDIA IMPORT (S2-T8b): Image/GIF buttons ask MAIN to open the file dialog
  * and embed the picked file as a data: URL — the renderer never sees a file
@@ -40,20 +68,49 @@ import {
  * explicit hint (committing them there would fail hardening.validateScene).
  * Staged drafts are carried into the first imported media background.
  *
- * DIRECT MANIPULATION (S2-T9): overlays are selected by click (preview or
- * list) and moved/rotated/resized with pointer events. During a gesture only
- * a local ghost — a CSS transform on the widget wrapper — updates; scene
- * state (and therefore the debounced scene:preview IPC) does not move until
- * pointerup, when the gesture-clamped values commit exactly once and the
- * engine PNG follows. The renderer composes no pixels: the ghost is
- * positioning guidance, the preview <img> stays the sidecar's output.
+ * DIRECT MANIPULATION (S2-T9 -> S7-T21): the stage is a Konva/react-konva
+ * Layer in SceneStage.tsx. The sidecar's engine PNG is its BASE <Image>
+ * (loaded through use-image); the overlay nodes above it are GUIDANCE only —
+ * this file still composes no pixels, and the PNG underneath stays the
+ * single source of truth. Gestures commit their clamped values LIVE into
+ * scene state (that is what makes history coalescing observable), while
+ * schedulePreview is gated so the panel still sees exactly ONE debounced
+ * scene:preview per gesture, from the same 250 ms source as every other edit.
+ *
+ * GESTURE COALESCING (S7-T21): exactly ONE undo entry per gesture — a
+ * drag/resize/rotate, or one focused numeric edit session. beginCoalesce
+ * snapshots the pre-gesture scene and pauses zundo's temporal store; the
+ * live commits therefore record nothing; endCoalesce rewinds to that
+ * snapshot WHILE STILL PAUSED (the rewind records nothing either), resumes,
+ * and commits the final value, so zundo writes exactly one entry whose undo
+ * target IS the snapshot. The `owner` tag keeps a field blur from closing a
+ * drag (and vice versa).
  */
 
 const PREVIEW_DEBOUNCE_MS = 250;
 const HEX_COLOR = /^#[0-9a-fA-F]{6}$/;
 const COLOR_FALLBACK = "#000000";
+const SHORT_HEX = /^#[0-9a-fA-F]{3}$/;
+
+/**
+ * Accept the canonical #rrggbb form plus react-colorful's possible #abc
+ * shorthand, always committing the canonical 6-digit shape the validator
+ * requires. Reject, never coerce: an unparseable value returns null and
+ * commits NOTHING.
+ */
+function normalizeHexColor(raw: string): string | null {
+  if (HEX_COLOR.test(raw)) return raw;
+  if (SHORT_HEX.test(raw)) {
+    return `#${raw[1]}${raw[1]}${raw[2]}${raw[2]}${raw[3]}${raw[3]}`;
+  }
+  return null;
+}
+
+/** Coalescing session owners: S7-T21 drag/field, S7-T22 color. */
+type CoalesceOwner = "drag" | "field" | "color";
 
 type UnitField = "x" | "y" | "size" | "rotation";
+type BaseUnitField = "x" | "y" | "size";
 type TransformField = "rotation" | "scale" | "panX" | "panY";
 
 const EMPTY_UNIT_DRAFTS: Record<UnitField, string> = {
@@ -61,6 +118,12 @@ const EMPTY_UNIT_DRAFTS: Record<UnitField, string> = {
   y: "0.5",
   size: "0.1",
   rotation: "0",
+};
+
+const EMPTY_BASE_UNIT_DRAFTS: Record<BaseUnitField, string> = {
+  x: "0.5",
+  y: "0.5",
+  size: "0.1",
 };
 
 const INITIAL_TRANSFORM: Record<TransformField, string> = {
@@ -90,15 +153,12 @@ const UNIT_RANGES: Record<UnitField, readonly [number, number]> = {
   rotation: [-360, 360],
 };
 
-/** Declared overlay rotation range — inspector and rotation handle share it. */
-const OVERLAY_ROTATION_RANGE: readonly [number, number] = [-360, 360];
-
-/**
- * Gesture-time floor for resize. The validator accepts size in [0,1], but a
- * 0-size widget is invisible and ungrabbable, so the drag clamps at 0.01 —
- * still inside the validator's range.
- */
-const MIN_OVERLAY_SIZE = 0.01;
+function baseFieldLabel(widget: BaseWidget, field: BaseUnitField): string {
+  const { label, sizeUnit } = BASE_WIDGET_META[widget];
+  if (field === "size") return `${label} size (0-1 ${sizeUnit})`;
+  const axis = field === "x" ? "width" : "height";
+  return `${label} ${field.toUpperCase()} (0-1 ${axis})`;
+}
 
 /**
  * Draft-record pattern: unparseable input ("" or a trailing ".") stays a
@@ -132,130 +192,6 @@ function stagedValue(
 /** Transform fields are schema-bound to these kinds (video stays out of S2-T8b). */
 function isMediaKind(background: Background): background is Extract<Background, { kind: "image" | "gif" }> {
   return background.kind === "image" || background.kind === "gif";
-}
-
-// ---------------------------------------------------------------- gestures
-
-// S2-T9 direct manipulation. The ghost is a CSS transform evaluated on every
-// pointermove (0 ms, zero IPC); the engine PNG is requested only when scene
-// state changes — i.e. on release. Coordinates stay 0-1 normalized in
-// glass/portrait space; every px delta converts through the stage's MEASURED
-// rect, so a differently-sized preview (or DPR) maps correctly.
-
-type GestureMode = "move" | "resize" | "rotate";
-
-interface StageRect {
-  left: number;
-  top: number;
-  width: number;
-  height: number;
-}
-
-interface GestureState {
-  index: number;
-  mode: GestureMode;
-  pointerId: number;
-  startClientX: number;
-  startClientY: number;
-  clientX: number;
-  clientY: number;
-  /** Stage rect measured once at pointerdown; deltas never re-measure. */
-  rect: StageRect;
-  originX: number;
-  originY: number;
-  originSize: number;
-  originRotation: number;
-}
-
-interface OverlayPlacement {
-  x: number;
-  y: number;
-  size: number;
-  rotation: number;
-}
-
-function clampNumber(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
-}
-
-/**
- * Ghost math: current pointer -> placement, clamped DURING the gesture so
- * neither the ghost nor the released scene can leave the ranges
- * hardening.validateScene enforces (x/y/size in [0,1], rotation finite and
- * inside the declared [-360,360]). Pure: called on every render while a
- * gesture is live.
- */
-function gesturePlacement(g: GestureState): OverlayPlacement {
-  const { rect, originX, originY, originSize, originRotation } = g;
-  const dx = g.clientX - g.startClientX;
-  const dy = g.clientY - g.startClientY;
-  if (g.mode === "move") {
-    // Clamp the PIXEL delta against the origin first so the ghost transform
-    // stays pixel-exact against the measured rect, then clamp the unit value
-    // again: float rounding at the edge could otherwise emit
-    // 1.0000000000000002 and fail the gate on release.
-    const dxPx = clampNumber(dx, -originX * rect.width, (1 - originX) * rect.width);
-    const dyPx = clampNumber(dy, -originY * rect.height, (1 - originY) * rect.height);
-    return {
-      x: clampNumber(originX + dxPx / rect.width, 0, 1),
-      y: clampNumber(originY + dyPx / rect.height, 0, 1),
-      size: originSize,
-      rotation: originRotation,
-    };
-  }
-  if (g.mode === "resize") {
-    // `size` is a fraction of CANVAS HEIGHT (the engine renders
-    // font_px = size * h), so normalize both axes in stage units and average
-    // them: the corner handle tracks the pointer on either axis.
-    const delta = (dx / rect.width + dy / rect.height) / 2;
-    return {
-      x: originX,
-      y: originY,
-      size: clampNumber(originSize + delta, MIN_OVERLAY_SIZE, 1),
-      rotation: originRotation,
-    };
-  }
-  // rotate: angle of the pointer around the widget anchor (the engine centers
-  // every overlay at (x, y)); +90 converts atan2's 0=right into 0=up, giving
-  // degrees that are clockwise-positive like the engine's Pillow
-  // rotate(-rotation). Delta is unwrapped past ±180 so crossing the top
-  // never snaps the ghost the long way around.
-  const cx = rect.left + originX * rect.width;
-  const cy = rect.top + originY * rect.height;
-  const angleAt = (px: number, py: number): number =>
-    Math.atan2(py - cy, px - cx) * (180 / Math.PI) + 90;
-  let delta = angleAt(g.clientX, g.clientY) - angleAt(g.startClientX, g.startClientY);
-  while (delta > 180) delta -= 360;
-  while (delta < -180) delta += 360;
-  return {
-    x: originX,
-    y: originY,
-    size: originSize,
-    rotation: clampNumber(
-      originRotation + delta,
-      OVERLAY_ROTATION_RANGE[0],
-      OVERLAY_ROTATION_RANGE[1]
-    ),
-  };
-}
-
-/**
- * The ghost IS this string: the wrapper's static placement (left/top/height,
- * from committed scene state) never moves mid-gesture — only the transform
- * does. Zero deltas render the plain centering transform, so a released
- * gesture leaves no residue behind.
- */
-function overlayBoxTransform(
-  dxPx: number,
-  dyPx: number,
-  rotation: number,
-  scale: number
-): string {
-  const parts = ["translate(-50%, -50%)"];
-  if (dxPx !== 0 || dyPx !== 0) parts.push(`translate(${dxPx}px, ${dyPx}px)`);
-  if (rotation !== 0) parts.push(`rotate(${rotation}deg)`);
-  if (scale !== 1) parts.push(`scale(${scale})`);
-  return parts.join(" ");
 }
 
 // Keep in sync with the mediaImportError tokens in src/main.js (main process).
@@ -415,9 +351,82 @@ async function sceneRejectionDetail(
   return "Scene value not allowed. Fix it and try again.";
 }
 
+/**
+ * Elements that own the browser's native text undo/redo (typing surfaces).
+ * WHY: the editor-scoped Ctrl+Z must never steal history from a text
+ * field — editing text and editing the scene are different histories, and
+ * native undo is what users expect while a field has focus.
+ */
+function isEditableTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  return (
+    target.tagName === "INPUT" ||
+    target.tagName === "TEXTAREA" ||
+    target.tagName === "SELECT" ||
+    target.isContentEditable
+  );
+}
+
+/**
+ * Rail sections (S7-T19): TRCC-style persistent navigation — pick a
+ * section and edit immediately, no enter/exit edit mode. The labels are
+ * the owner-specified section names; every other copy in this file stays
+ * English. `fondo` owns the background KIND together with its transform
+ * because the validator binds transform keys to image/gif backgrounds
+ * only: splitting them would split one editing concern across sections.
+ */
+const SCENE_SECTIONS = [
+  { id: "fondo", label: "Fondo" },
+  { id: "capas", label: "Capas" },
+  { id: "propiedades", label: "Propiedades" },
+] as const;
+
+type SceneSectionId = (typeof SCENE_SECTIONS)[number]["id"];
+
+type AriaValidationProps = {
+  "aria-invalid"?: true;
+  "aria-describedby"?: string;
+};
+
+function findValidationIssue(
+  issues: readonly SceneValidationIssue[],
+  paths: readonly string[]
+): SceneValidationIssue | undefined {
+  return issues.find((issue) => paths.includes(issue.path));
+}
+
+function validationProps(
+  field: string,
+  issues: readonly SceneValidationIssue[],
+  paths: readonly string[]
+): AriaValidationProps {
+  return findValidationIssue(issues, paths)
+    ? {
+        "aria-invalid": true,
+        "aria-describedby": `${field}-error`,
+      }
+    : {};
+}
+
+function validationMessage(
+  field: string,
+  issues: readonly SceneValidationIssue[],
+  paths: readonly string[]
+): ReactNode {
+  const issue = findValidationIssue(issues, paths);
+  if (!issue) return null;
+  return (
+    <p id={`${field}-error`} role="status" className="text-xs text-destructive">
+      {issue.message}
+    </p>
+  );
+}
+
 interface SceneEditorProps {
   scene: Scene;
   onSceneChange: (scene: Scene) => void;
+  /** Production wires the identity-guarded store action; tests may use the props facade. */
+  onBasePlacementChange?: (widget: BaseWidget, placement: BasePlacement) => void;
   onReset: () => void;
   /** Called after a successful save so App can refresh its reset baseline. */
   onSaved?: (scene: Scene) => void;
@@ -426,31 +435,124 @@ interface SceneEditorProps {
 export default function SceneEditor({
   scene,
   onSceneChange,
+  onBasePlacementChange,
   onReset,
   onSaved,
 }: SceneEditorProps) {
   // Ephemeral editor-local state (see file header).
   const [selected, setSelected] = useState<number | null>(0);
-  // Gesture bookkeeping: the ref is the source of truth for the window
-  // listeners (no stale closures); state only drives the ghost re-render.
-  const [gesture, setGestureState] = useState<GestureState | null>(null);
-  const gestureRef = useRef<GestureState | null>(null);
-  const stageRef = useRef<HTMLDivElement | null>(null);
-  // Teardown for the in-flight gesture's window listeners (unmount-safe).
-  const endGestureTracking = useRef<(() => void) | null>(null);
-  const setGesture = (next: GestureState | null) => {
-    gestureRef.current = next;
-    setGestureState(next);
+  const [selectedBase, setSelectedBase] = useState<BaseWidget | null>(null);
+  // Active rail section (S7-T19): persistent nav, no edit-mode toggle.
+  const [section, setSection] = useState<SceneSectionId>("fondo");
+  // S7-T21 gesture coalescing (see file header): history is paused for the
+  // whole gesture and exactly one entry is written when it ends.
+  const coalescing = useRef<{ owner: CoalesceOwner; snapshot: Scene } | null>(
+    null
+  );
+  // Live gestures commit scene values (that is what makes coalescing
+  // observable), so this gate keeps the 250 ms preview from re-arming until
+  // the gesture lifts: a drag still costs exactly ONE preview request.
+  const gestureActive = useRef(false);
+  // Which editable field owns the current coalescing session (focus -> blur).
+  const focusedField = useRef<string | null>(null);
+  // S7-T22 color-gesture state (react-colorful): one pointer press opens an
+  // owner-tagged "color" session; the snapshot tells release whether ANY
+  // value actually changed (a tap that re-emits the current color must
+  // record nothing — the snapshot === scene branch stays honored).
+  const colorGestureActive = useRef(false);
+  const colorGestureSnapshot = useRef<Scene | null>(null);
+  // Window-level release listeners capture their closure at REGISTRATION
+  // time, so they call through this ref — refreshed on every render — to
+  // reach the latest endColorGesture (fresh scene/endCoalesce/schedulePreview).
+  const colorReleaseRef = useRef<() => void>(() => {});
+
+  const handleWindowRelease = useCallback(() => {
+    colorReleaseRef.current();
+  }, []);
+
+  const endCoalesce = (owner: CoalesceOwner): void => {
+    const active = coalescing.current;
+    if (!active || active.owner !== owner) return;
+    coalescing.current = null;
+    if (active.snapshot === scene) {
+      // Nothing actually moved (a plain tap, or focus without an edit):
+      // record nothing — selecting must never dirty the scene OR history.
+      useSceneStore.temporal.getState().resume();
+      return;
+    }
+    commitScene(active.snapshot); // unrecorded rewind (still paused)
+    useSceneStore.temporal.getState().resume();
+    commitScene(scene); // final value -> exactly ONE history entry
   };
+
+  const beginCoalesce = (owner: CoalesceOwner, snapshot: Scene): void => {
+    if (coalescing.current?.owner === owner) return; // already coalescing
+    // Defensive: another session is still open (its blur may not have
+    // arrived). Close it first so its edits get their own single entry.
+    if (coalescing.current) endCoalesce(coalescing.current.owner);
+    coalescing.current = { owner, snapshot };
+    useSceneStore.temporal.getState().pause();
+  };
+
+  /**
+   * S7-T22 color gesture (react-colorful): pointer boundaries open/close the
+   * "color" coalescing session, so ONE pointer press = ONE history entry no
+   * matter how many onChange values stream mid-gesture. The release listener
+   * also lives on `window` because a pointer can be released OUTSIDE the
+   * wrapper; live commits stay gated (gestureActive) so the panel sees
+   * exactly ONE debounced preview after the gesture, from the same 250 ms
+   * source as every other edit.
+   */
+  const beginColorGesture = (): void => {
+    if (colorGestureActive.current) return;
+    colorGestureActive.current = true;
+    colorGestureSnapshot.current = scene;
+    gestureActive.current = true; // suppress previews until the release
+    beginCoalesce("color", scene);
+    window.addEventListener("pointerup", handleWindowRelease);
+    window.addEventListener("pointercancel", handleWindowRelease);
+  };
+
+  const endColorGesture = (): void => {
+    if (!colorGestureActive.current) return;
+    colorGestureActive.current = false;
+    window.removeEventListener("pointerup", handleWindowRelease);
+    window.removeEventListener("pointercancel", handleWindowRelease);
+    const startedAt = colorGestureSnapshot.current;
+    colorGestureSnapshot.current = null;
+    const changed = startedAt !== scene; // any live commit rebuilt the scene
+    gestureActive.current = false; // unblock previews BEFORE the final commit
+    endCoalesce("color");
+    if (changed) schedulePreview(scene); // ONE debounced push, single source
+  };
+
+  // Refresh the window-release target every render (see colorReleaseRef).
+  useEffect(() => {
+    colorReleaseRef.current = endColorGesture;
+  });
+
+  // Unmount mid-gesture must never leave history frozen OR window listeners
+  // attached to a dead component.
   useEffect(
     () => () => {
-      endGestureTracking.current?.();
+      if (colorGestureActive.current) {
+        colorGestureActive.current = false;
+        window.removeEventListener("pointerup", handleWindowRelease);
+        window.removeEventListener("pointercancel", handleWindowRelease);
+      }
+      if (coalescing.current) {
+        coalescing.current = null;
+        useSceneStore.temporal.getState().resume();
+      }
     },
     []
   );
   const [unitDrafts, setUnitDrafts] = useState<Record<UnitField, string>>(
     EMPTY_UNIT_DRAFTS
   );
+  const [baseUnitDrafts, setBaseUnitDrafts] = useState<
+    Record<BaseUnitField, string>
+  >(EMPTY_BASE_UNIT_DRAFTS);
   const [transform, setTransform] =
     useState<Record<TransformField, string>>(INITIAL_TRANSFORM);
   const [flipH, setFlipH] = useState(false);
@@ -460,6 +562,14 @@ export default function SceneEditor({
   const [saveError, setSaveError] = useState<string | null>(null);
   const [savedNote, setSavedNote] = useState<string | null>(null);
   const [importError, setImportError] = useState<string | null>(null);
+  const [draftValidationIssues, setDraftValidationIssues] = useState<
+    SceneValidationIssue[]
+  >([]);
+
+  // S7-T20 history controls: reactive against zundo's temporal store, so
+  // the buttons disable live at both ends of history (empty at boot root).
+  const canUndo = useCanUndo();
+  const canRedo = useCanRedo();
 
   // Refs, not state: debounce timers and stale-reply guards must not trigger
   // re-renders or capture stale closures.
@@ -467,16 +577,99 @@ export default function SceneEditor({
   const previewTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const overlays = scene.overlays;
+  const basePlacements = useMemo(
+    () => resolveBasePlacements(scene.basePlacements),
+    [scene.basePlacements]
+  );
   const safeIndex =
     selected === null ? -1 : Math.min(selected, Math.max(0, overlays.length - 1));
-  const selectedOverlay = safeIndex >= 0 ? (overlays[safeIndex] ?? null) : null;
-  // Recomputed per render while a gesture is live; pure (see gesturePlacement).
-  const ghost = gesture !== null ? gesturePlacement(gesture) : null;
+  const selectedBasePlacement = selectedBase ? basePlacements[selectedBase] : null;
+  const selectedOverlay =
+    selectedBase === null && safeIndex >= 0 ? (overlays[safeIndex] ?? null) : null;
   const backgroundKind = scene.background.kind;
   const backgroundColor =
     scene.background.kind === "color" ? scene.background.color : COLOR_FALLBACK;
   const mediaBackground = isMediaKind(scene.background) ? scene.background : null;
   const atCap = overlays.length >= SCENE_OVERLAYS_CAP;
+
+  const selectOverlay = (index: number | null): void => {
+    setSelectedBase(null);
+    setSelected(index);
+  };
+
+  const selectBaseWidget = (widget: BaseWidget | null): void => {
+    setSelected(null);
+    setSelectedBase(widget);
+  };
+
+  // Observe the current/hydrated scene for feedback only. App/store hydration
+  // remains untouched; the authoritative save and USB gates stay in main/Python.
+  const currentValidation = useMemo(
+    () => validateSceneForEditor(scene),
+    [scene]
+  );
+  const currentValidationIssues = currentValidation.success
+    ? []
+    : currentValidation.issues;
+  const validationIssues =
+    draftValidationIssues.length > 0
+      ? draftValidationIssues
+      : currentValidationIssues;
+
+  // A rejected candidate never reaches the store. Restore controlled drafts
+  // from the store-owned scene so a failed numeric edit cannot leave a value
+  // visible that the canvas and persistence path never accepted. Non-media
+  // transform drafts remain staged by design and are carried into an import.
+  const restoreRejectedDrafts = (): void => {
+    const overlay = safeIndex >= 0 ? scene.overlays[safeIndex] ?? null : null;
+    setUnitDrafts(
+      overlay
+        ? {
+            x: String(overlay.x),
+            y: String(overlay.y),
+            size: String(overlay.size),
+            rotation: String(overlay.rotation),
+          }
+        : EMPTY_UNIT_DRAFTS
+    );
+    const base = selectedBase ? basePlacements[selectedBase] : null;
+    setBaseUnitDrafts(
+      base
+        ? { x: String(base.x), y: String(base.y), size: String(base.size) }
+        : EMPTY_BASE_UNIT_DRAFTS
+    );
+    const background = scene.background;
+    if (!isMediaKind(background)) return;
+    setTransform({
+      rotation: String(background.rotation),
+      scale: String(background.scale),
+      panX: String(background.panX),
+      panY: String(background.panY),
+    });
+    setFlipH(background.flipH);
+    setFit(background.fit);
+  };
+
+  const selectedOverlayPath = (field: string): string =>
+    safeIndex >= 0 ? `overlays[${safeIndex}].${field}` : "scene";
+
+  // A failed local candidate never reaches onSceneChange, so zundo cannot
+  // record a validation-only entry; IPC still validates independently on save.
+  // Acceptance follows the frozen model, while the editor policy remains
+  // warning-only in currentValidation below.
+  const commitScene = (next: Scene): boolean => {
+    const validation = validateSceneForModel(next);
+    if (!validation.success) {
+      setDraftValidationIssues(validation.issues);
+      restoreRejectedDrafts();
+      setSavedNote(null);
+      return false;
+    }
+    setDraftValidationIssues([]);
+    onSceneChange(next);
+    setSavedNote(null);
+    return true;
+  };
 
   // Keep drafts aligned with the selected overlay whenever the scene or the
   // selection changes (add/remove/switch/Reset all flow through here).
@@ -494,6 +687,19 @@ export default function SceneEditor({
         : EMPTY_UNIT_DRAFTS
     );
   }, [scene, safeIndex]);
+
+  useEffect(() => {
+    const placement = selectedBase ? basePlacements[selectedBase] : null;
+    setBaseUnitDrafts(
+      placement
+        ? {
+            x: String(placement.x),
+            y: String(placement.y),
+            size: String(placement.size),
+          }
+        : EMPTY_BASE_UNIT_DRAFTS
+    );
+  }, [basePlacements, selectedBase]);
 
   // Media backgrounds own the transform values: mirror them back into the
   // drafts whenever scene state changes (Reset, external load, own commits),
@@ -514,6 +720,11 @@ export default function SceneEditor({
   }, [scene]);
 
   const schedulePreview = useCallback((next: Scene) => {
+    // S7-T21: a gesture commits live values on every move (that is what
+    // makes coalescing observable), but the panel must not repaint until the
+    // finger lifts — ONE debounced preview per gesture, still from the single
+    // PREVIEW_DEBOUNCE_MS source (never a second timer constant).
+    if (gestureActive.current) return;
     if (previewTimer.current) clearTimeout(previewTimer.current);
     previewTimer.current = setTimeout(() => {
       const seq = seqRef.current + 1;
@@ -559,6 +770,10 @@ export default function SceneEditor({
       return next;
     });
 
+  const setBaseUnitDraft = (field: BaseUnitField, value: string): void => {
+    setBaseUnitDrafts((previous) => ({ ...previous, [field]: value }));
+  };
+
   const setTransformDraft = (field: TransformField, value: string) =>
     setTransform((prev) => {
       const next: Record<TransformField, string> = {
@@ -572,114 +787,165 @@ export default function SceneEditor({
     });
 
   const commitOverlays = (next: Scene["overlays"]) =>
-    onSceneChange({ ...scene, overlays: next });
+    commitScene({ ...scene, overlays: next });
+
+  const commitBasePlacement = (
+    widget: BaseWidget,
+    placement: BasePlacement
+  ): boolean => {
+    if (sameBasePlacement(scene.basePlacements?.[widget], placement)) return true;
+    const next: Scene = {
+      ...scene,
+      basePlacements: {
+        ...scene.basePlacements,
+        [widget]: { ...placement },
+      },
+    };
+    const validation = validateSceneForModel(next);
+    if (!validation.success) {
+      setDraftValidationIssues(validation.issues);
+      restoreRejectedDrafts();
+      setSavedNote(null);
+      return false;
+    }
+    setDraftValidationIssues([]);
+    if (onBasePlacementChange) {
+      onBasePlacementChange(widget, { ...placement });
+      setSavedNote(null);
+    } else if (!commitScene(next)) {
+      return false;
+    }
+    return true;
+  };
 
   /**
-   * pointerdown -> capture -> window pointermove/pointerup. Selection
-   * happens here (a tap IS a selection); scene state changes only in
-   * finish(true), so every move costs zero scene:preview requests and the
-   * release commits exactly once (one debounced preview follows). The
-   * `scene` closure is the snapshot from the render that saw pointerdown —
-   * safe because no other commit can run while a gesture holds the pointer.
+   * S7-T21 gesture bridge to the Konva stage (SceneStage.tsx owns
+   * hit-testing and the px->unit math). This component owns what a gesture
+   * MEANS for history and preview: one coalesced undo entry and one
+   * debounced engine preview per gesture. The `scene` closure is the value
+   * from the render that saw dragstart — safe because a gesture is the only
+   * thing committing while it holds the pointer, and endCoalesce re-reads
+   * the LATEST closure (the render produced by the last live commit).
    */
-  const beginGesture = (
+  const handleGestureBegin = (index: number): void => {
+    if (!scene.overlays[index]) return;
+    selectOverlay(index);
+    gestureActive.current = true; // suppress previews until the release
+    beginCoalesce("drag", scene);
+    setSavedNote(null);
+  };
+
+  const handleGestureMove = (
     index: number,
-    mode: GestureMode,
-    e: ReactPointerEvent<HTMLElement>
-  ) => {
-    if (gestureRef.current) return; // one gesture at a time
-    if (e.button !== 0) return; // primary button / touch only
-    const overlay = scene.overlays[index];
-    const stage = stageRef.current;
-    if (!overlay) return;
-    setSelected(index);
-    if (!stage) return;
-    const rect = stage.getBoundingClientRect();
-    // No measurable stage (no layout yet): px->unit is undefined, so fall
-    // back to selection-only instead of committing NaN.
-    if (!(rect.width > 0) || !(rect.height > 0)) return;
+    placement: OverlayPlacement
+  ): void => {
+    if (!scene.overlays[index]) return;
+    // Live commit: this is what makes coalescing observable, and it is safe
+    // because beginCoalesce already paused zundo for this gesture.
+    commitOverlays(
+      scene.overlays.map((overlay, i) =>
+        i === index ? { ...overlay, ...placement } : overlay
+      )
+    );
+    setSavedNote(null);
+  };
 
-    setGesture({
-      index,
-      mode,
-      pointerId: e.pointerId,
-      startClientX: e.clientX,
-      startClientY: e.clientY,
-      clientX: e.clientX,
-      clientY: e.clientY,
-      rect: {
-        left: rect.left,
-        top: rect.top,
-        width: rect.width,
-        height: rect.height,
-      },
-      originX: overlay.x,
-      originY: overlay.y,
-      originSize: overlay.size,
-      originRotation: overlay.rotation,
+  const finishCoalescedGesture = (): void => {
+    const active = coalescing.current;
+    const changed = active !== null && active.snapshot !== scene;
+    gestureActive.current = false; // unblock previews BEFORE the final commit
+    endCoalesce("drag");
+    if (!changed) return;
+    // Release preview, GUARANTEED: endCoalesce rewinds and re-sets the scene,
+    // which can net back to an identity React bails out on (Object.is), so the
+    // [scene] effect may never re-run — schedule explicitly here. Still the
+    // single PREVIEW_DEBOUNCE_MS timer; a mid-gesture schedule is impossible
+    // because the gate above was open only after the last commit.
+    schedulePreview(scene);
+  };
+
+  const handleGestureEnd = finishCoalescedGesture;
+
+  const handleBaseGestureBegin = (widget: BaseWidget): void => {
+    selectBaseWidget(widget);
+    gestureActive.current = true;
+    beginCoalesce("drag", scene);
+    setSavedNote(null);
+  };
+
+  const handleBaseGestureMove = (
+    widget: BaseWidget,
+    placement: BasePlacement
+  ): void => {
+    commitBasePlacement(widget, placement);
+  };
+
+  const handleBaseGestureEnd = finishCoalescedGesture;
+
+  /**
+   * S7-T22 dnd-kit commit (Capas): the DROP mutates the array through the
+   * store — one `set` in sceneStore.reorderOverlays IS the single history
+   * entry (no commits exist during the drag, so there is nothing to
+   * coalesce), and the [scene] effect arms the usual ONE debounced preview.
+   *
+   * SELECTION STABILITY (index → identity, CRITICAL): selection is an
+   * index, and a reorder SHIFTS indices. The selected overlay OBJECT is
+   * captured before the move and re-found by reference (`indexOf`) after —
+   * the selection follows the same overlay, and SceneStage's positional
+   * `overlay-N` ids / handles (re-derived from the array on every render)
+   * therefore land on the right objects.
+   */
+  const handleReorder = (from: number, to: number): void => {
+    if (from === to) return;
+    if (from < 0 || from >= overlays.length) return;
+    if (to < 0 || to >= overlays.length) return;
+    const anchor = safeIndex >= 0 ? overlays[safeIndex] ?? null : null;
+    const reordered = overlays.slice();
+    const moved = reordered[from];
+    if (!moved) return;
+    reordered.splice(from, 1);
+    reordered.splice(to, 0, moved);
+    const validation = validateSceneForModel({
+      ...scene,
+      overlays: reordered,
     });
-
-    // Capture keeps retargeting to the pressed element; the window listeners
-    // below are the delivery path (and the only one jsdom implements).
-    const captureTarget = e.currentTarget;
-    try {
-      captureTarget.setPointerCapture?.(e.pointerId);
-    } catch {
-      // capture is a progressive enhancement; listeners still receive moves
-    }
-    const releaseCapture = () => {
-      try {
-        if (captureTarget.hasPointerCapture?.(e.pointerId)) {
-          captureTarget.releasePointerCapture(e.pointerId);
-        }
-      } catch {
-        // pointercancel may have released the capture before this ran
-      }
-    };
-
-    const detach = () => {
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", onUp);
-      window.removeEventListener("pointercancel", onCancel);
-      endGestureTracking.current = null;
-    };
-    const finish = (commit: boolean) => {
-      const g = gestureRef.current;
-      releaseCapture();
-      detach();
-      setGesture(null);
-      if (!commit || !g) return;
-      const placement = gesturePlacement(g);
-      if (
-        placement.x === g.originX &&
-        placement.y === g.originY &&
-        placement.size === g.originSize &&
-        placement.rotation === g.originRotation
-      ) {
-        return; // a plain tap selects but must not dirty the scene
-      }
-      commitOverlays(
-        scene.overlays.map((o, i) => (i === g.index ? { ...o, ...placement } : o))
-      );
+    if (!validation.success) {
+      setDraftValidationIssues(validation.issues);
       setSavedNote(null);
-    };
-    const onMove = (ev: PointerEvent) => {
-      const g = gestureRef.current;
-      if (!g) return;
-      if (!Number.isFinite(ev.clientX) || !Number.isFinite(ev.clientY)) return;
-      setGesture({ ...g, clientX: ev.clientX, clientY: ev.clientY });
-    };
-    const onUp = () => finish(true);
-    // Cancel reverts: the ghost disappears, nothing commits.
-    const onCancel = () => finish(false);
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp);
-    window.addEventListener("pointercancel", onCancel);
-    endGestureTracking.current = () => {
-      releaseCapture();
-      detach();
-      setGesture(null);
-    };
+      return;
+    }
+    setDraftValidationIssues([]);
+    useSceneStore.getState().reorderOverlays(from, to);
+    if (!anchor) return;
+    const next = useSceneStore.getState().scene.overlays;
+    const newIndex = next.indexOf(anchor);
+    if (newIndex >= 0 && newIndex !== safeIndex) selectOverlay(newIndex);
+  };
+
+  /**
+   * Field coalescing at the editor ROOT: focusin/focusout bubble, so one
+   * pair of handlers covers every inspector input instead of wiring each
+   * control. Editable targets only (same gate as the Ctrl+Z handler), keyed
+   * by control id so blur always closes the session focus opened.
+   */
+  const handleRootFocus = (event: { target: EventTarget }): void => {
+    const target = event.target;
+    if (!(target instanceof HTMLElement) || !isEditableTarget(target)) return;
+    const key = target.id || target.tagName;
+    if (focusedField.current !== null && focusedField.current !== key) {
+      endCoalesce("field"); // a previous field never blurred (defensive)
+    }
+    focusedField.current = key;
+    beginCoalesce("field", scene);
+  };
+
+  const handleRootBlur = (event: { target: EventTarget }): void => {
+    const target = event.target;
+    if (!(target instanceof HTMLElement) || !isEditableTarget(target)) return;
+    const key = target.id || target.tagName;
+    if (focusedField.current !== key) return;
+    focusedField.current = null;
+    endCoalesce("field");
   };
 
   const handleUnit = (field: UnitField, raw: string) => {
@@ -701,6 +967,21 @@ export default function SceneEditor({
     setSavedNote(null);
   };
 
+  const handleBaseUnit = (
+    field: BaseUnitField,
+    raw: string
+  ): void => {
+    const [min, max] = UNIT_RANGES[field];
+    const result = stagedNumber(raw, min, max);
+    setBaseUnitDraft(field, result ? result.draft : raw);
+    if (!result || !selectedBase || !selectedBasePlacement) return;
+    commitBasePlacement(selectedBase, {
+      x: field === "x" ? result.commit : selectedBasePlacement.x,
+      y: field === "y" ? result.commit : selectedBasePlacement.y,
+      size: field === "size" ? result.commit : selectedBasePlacement.size,
+    });
+  };
+
   const handleTransform = (field: TransformField, raw: string) => {
     const [min, max] = TRANSFORM_RANGES[field];
     const result = stagedNumber(raw, min, max);
@@ -710,7 +991,7 @@ export default function SceneEditor({
     // the hint below the section) instead of failing validateScene.
     const current = scene.background;
     if (!result || !isMediaKind(current)) return;
-    onSceneChange({
+    commitScene({
       ...scene,
       background: { ...current, [field]: result.commit },
     });
@@ -721,7 +1002,7 @@ export default function SceneEditor({
     setFlipH(next);
     const current = scene.background;
     if (!isMediaKind(current)) return;
-    onSceneChange({ ...scene, background: { ...current, flipH: next } });
+    commitScene({ ...scene, background: { ...current, flipH: next } });
     setSavedNote(null);
   };
 
@@ -729,7 +1010,7 @@ export default function SceneEditor({
     setFit(next);
     const current = scene.background;
     if (!isMediaKind(current)) return;
-    onSceneChange({ ...scene, background: { ...current, fit: next } });
+    commitScene({ ...scene, background: { ...current, fit: next } });
     setSavedNote(null);
   };
 
@@ -747,16 +1028,34 @@ export default function SceneEditor({
   };
 
   const handleOverlayColor = (raw: string) => {
-    if (!HEX_COLOR.test(raw)) return;
-    const overlaysNext = overlays.map((overlay, i) =>
-      i === safeIndex ? { ...overlay, color: raw } : overlay
+    // Reject, never coerce: only canonical #rrggbb (plus react-colorful's
+    // possible #abc shorthand, expanded) ever reaches the scene.
+    const hex = normalizeHexColor(raw);
+    if (!hex) return;
+    const overlay = safeIndex >= 0 ? overlays[safeIndex] : undefined;
+    // Same-value guard (S7-T22): a tap that re-emits the current color must
+    // not rebuild the scene — with no commit, snapshot === scene at release
+    // and endCoalesce records ZERO entries for a gesture that changed nothing.
+    if (!overlay || overlay.color === hex) return;
+    const overlaysNext = overlays.map((item, i) =>
+      i === safeIndex ? { ...item, color: hex } : item
     );
     commitOverlays(overlaysNext);
     setSavedNote(null);
   };
 
+  const handleBackgroundColor = (raw: string) => {
+    const hex = normalizeHexColor(raw);
+    if (!hex) return;
+    if (scene.background.kind === "color" && scene.background.color === hex) {
+      return;
+    }
+    commitScene({ ...scene, background: { kind: "color", color: hex } });
+    setSavedNote(null);
+  };
+
   const pickBackground = (kind: "none" | "color") => {
-    onSceneChange({
+    commitScene({
       ...scene,
       background:
         kind === "color"
@@ -801,14 +1100,14 @@ export default function SceneEditor({
       panY: stagedValue(transform.panY, TRANSFORM_RANGES.panY, 0),
       fit,
     };
-    onSceneChange({ ...scene, background: next });
+    commitScene({ ...scene, background: next });
     setSavedNote(null);
   };
 
   const clearBackground = () => {
     // Dropping media returns to none; the staged drafts stay local so a
     // re-import carries them forward again.
-    onSceneChange({ ...scene, background: { kind: "none" } });
+    commitScene({ ...scene, background: { kind: "none" } });
     setSavedNote(null);
     setImportError(null);
   };
@@ -826,7 +1125,7 @@ export default function SceneEditor({
     };
     const next = [...overlays, overlay];
     commitOverlays(next);
-    setSelected(next.length - 1); // a new overlay auto-selects
+    selectOverlay(next.length - 1); // a new overlay auto-selects
     setSavedNote(null);
   };
 
@@ -836,7 +1135,7 @@ export default function SceneEditor({
     if (safeIndex < 0 || !overlays.length) return;
     const next = overlays.filter((_, i) => i !== safeIndex);
     commitOverlays(next);
-    setSelected(Math.max(0, Math.min(safeIndex, next.length - 1)));
+    selectOverlay(Math.max(0, Math.min(safeIndex, next.length - 1)));
     setSavedNote(null);
   };
 
@@ -848,6 +1147,11 @@ export default function SceneEditor({
     }
     setSaveError(null);
     setSavedNote(null);
+    // Feedback only: the main-process and Python validators remain the save
+    // authority. An invalid persisted/external scene is still sent so this
+    // renderer never silently changes the existing pipeline contract.
+    const validation = validateSceneForEditor(scene);
+    setDraftValidationIssues(validation.success ? [] : validation.issues);
     try {
       const { rejected } = await bridge.saveSettings({ scene });
       if (rejected && rejected.includes("scene")) {
@@ -869,10 +1173,31 @@ export default function SceneEditor({
     setSaveError(null);
     setSavedNote(null);
     setImportError(null);
+    setDraftValidationIssues([]);
   };
 
-  return (
-    <div className="space-y-4">
+  /**
+   * Editor-scoped history shortcuts (S7-T20). WHY each check, in order:
+   * - the handler sits on the editor ROOT, so it fires only for events
+   *   originating inside the editor (scope: it cannot hijack the rest of
+   *   the window);
+   * - editable targets are skipped BEFORE anything else: native text undo
+   *   wins in inputs, so Ctrl+Z mid-typing never moves the scene;
+   * - preventDefault only when WE handle it, so the skipped native path is
+   *   never suppressed. Ctrl+Shift+Z redos. Windows-only app → Ctrl key.
+   */
+  const handleEditorKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (!event.ctrlKey || (event.key !== "z" && event.key !== "Z")) return;
+    if (isEditableTarget(event.target)) return;
+    event.preventDefault();
+    if (event.shiftKey) useSceneStore.getState().redo();
+    else useSceneStore.getState().undo();
+  };
+
+  // Panels are hoisted into variables so the rail can swap them while
+  // each block keeps its original shape (S7-T19 restructure).
+  const fondoPanel = (
+    <>
       {/* Background: none/color + media import (S2-T8b). Video (S3) and
           gpu-temp (S4) stay out until their own tasks. */}
       <div className="space-y-2">
@@ -918,17 +1243,37 @@ export default function SceneEditor({
         {scene.background.kind === "color" && (
           <div className="space-y-1">
             <Label htmlFor="scene-background-color">Background color</Label>
-            <Input
-              id="scene-background-color"
-              type="color"
-              value={HEX_COLOR.test(backgroundColor) ? backgroundColor : COLOR_FALLBACK}
-              onChange={(e) => {
-                const value = e.target.value;
-                if (!HEX_COLOR.test(value)) return;
-                onSceneChange({ ...scene, background: { kind: "color", color: value } });
-                setSavedNote(null);
-              }}
-            />
+            {/* S7-T22: react-colorful swatch (pointer gesture, coalesced
+                through the "color" owner) + the native field (typed hex /
+                keyboard) — two doors into the SAME existing
+                background.color field, gated by ONE handler. */}
+            <div
+              data-testid="background-color-gesture"
+              onPointerDown={beginColorGesture}
+              className="space-y-2"
+            >
+              <ColorPicker
+                value={HEX_COLOR.test(backgroundColor) ? backgroundColor : COLOR_FALLBACK}
+                onChange={handleBackgroundColor}
+                aria-label="Background color picker"
+              />
+              <Input
+                id="scene-background-color"
+                type="color"
+                value={HEX_COLOR.test(backgroundColor) ? backgroundColor : COLOR_FALLBACK}
+                onChange={(e) => handleBackgroundColor(e.target.value)}
+                {...validationProps(
+                  "scene-background-color",
+                  validationIssues,
+                  ["background.color"]
+                )}
+              />
+              {validationMessage(
+                "scene-background-color",
+                validationIssues,
+                ["background.color"]
+              )}
+            </div>
           </div>
         )}
         {mediaBackground && (
@@ -967,7 +1312,17 @@ export default function SceneEditor({
               inputMode="decimal"
               value={transform.rotation}
               onChange={(e) => handleTransform("rotation", e.target.value)}
+              {...validationProps(
+                "scene-rotation",
+                validationIssues,
+                ["background.rotation"]
+              )}
             />
+            {validationMessage(
+              "scene-rotation",
+              validationIssues,
+              ["background.rotation"]
+            )}
           </div>
           <div className="space-y-1">
             <Label htmlFor="scene-scale">Scale</Label>
@@ -976,7 +1331,9 @@ export default function SceneEditor({
               inputMode="decimal"
               value={transform.scale}
               onChange={(e) => handleTransform("scale", e.target.value)}
+              {...validationProps("scene-scale", validationIssues, ["background.scale"])}
             />
+            {validationMessage("scene-scale", validationIssues, ["background.scale"])}
           </div>
           <div className="space-y-1">
             <Label htmlFor="scene-pan-x">Pan X (-1 to 1)</Label>
@@ -985,7 +1342,9 @@ export default function SceneEditor({
               inputMode="decimal"
               value={transform.panX}
               onChange={(e) => handleTransform("panX", e.target.value)}
+              {...validationProps("scene-pan-x", validationIssues, ["background.panX"])}
             />
+            {validationMessage("scene-pan-x", validationIssues, ["background.panX"])}
           </div>
           <div className="space-y-1">
             <Label htmlFor="scene-pan-y">Pan Y (-1 to 1)</Label>
@@ -994,7 +1353,9 @@ export default function SceneEditor({
               inputMode="decimal"
               value={transform.panY}
               onChange={(e) => handleTransform("panY", e.target.value)}
+              {...validationProps("scene-pan-y", validationIssues, ["background.panY"])}
             />
+            {validationMessage("scene-pan-y", validationIssues, ["background.panY"])}
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-3">
@@ -1006,7 +1367,16 @@ export default function SceneEditor({
             />
             Flip horizontally
           </Label>
-          <div className="flex gap-2">
+          <div
+            className="flex gap-2"
+            role="group"
+            aria-label="Background fit"
+            aria-describedby={
+              findValidationIssue(validationIssues, ["background.fit"])
+                ? "scene-fit-error"
+                : undefined
+            }
+          >
             <Button
               type="button"
               size="sm"
@@ -1026,6 +1396,7 @@ export default function SceneEditor({
               Fill
             </Button>
           </div>
+          {validationMessage("scene-fit", validationIssues, ["background.fit"])}
         </div>
         {!mediaBackground && (
           <p className="text-xs text-muted-foreground">
@@ -1033,24 +1404,56 @@ export default function SceneEditor({
           </p>
         )}
       </div>
+    </>
+  );
 
-      {/* Text overlays: rows select, one inspector edits the selection. */}
-      <div className="space-y-2">
-        <p className="text-sm font-medium">Text overlays</p>
-        <div className="flex flex-wrap gap-2">
-          {overlays.map((overlay, index) => (
-            <Button
-              key={`overlay-row-${index}`}
-              type="button"
-              size="sm"
-              variant={safeIndex === index ? "default" : "outline"}
-              aria-pressed={safeIndex === index}
-              onClick={() => setSelected(index)}
-            >
-              {`Overlay ${index + 1}`}
-            </Button>
-          ))}
+  // Capas (S7-T22): the overlay list with dnd-kit sortable rows — select via
+  // the row button, reorder via the drag handle (pointer or keyboard). The
+  // row order IS scene.overlays order = the sidecar paint order (z-order).
+  const capasPanel = (
+    <>
+      <div className="flex flex-col gap-2 rounded-md border p-3">
+        <div>
+          <p className="text-sm font-medium">Spotify content</p>
+          <p className="text-xs text-muted-foreground">
+            These placement guides are painted below your scene overlays. Select
+            one to edit it; this group is not sortable with overlay rows.
+          </p>
         </div>
+        <ul
+          aria-label="Spotify content placement guides"
+          className="flex flex-col gap-1"
+        >
+          {BASE_WIDGET_KEYS.map((widget) => {
+            const meta = BASE_WIDGET_META[widget];
+            return (
+              <li key={`base-row-${widget}`}>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={selectedBase === widget ? "default" : "outline"}
+                  className="w-full justify-start"
+                  aria-pressed={selectedBase === widget}
+                  aria-label={`Select ${meta.label} placement guide. The panel renders the real Spotify ${meta.panelContent} here; the editor does not have live Spotify content.`}
+                  onClick={() => selectBaseWidget(widget)}
+                >
+                  {meta.label}
+                </Button>
+              </li>
+            );
+          })}
+        </ul>
+      </div>
+      <Separator />
+      {/* Text overlays: rows select; the selected one is edited in the
+          Propiedades section. */}
+      <div className="space-y-2">
+        <LayersList
+          overlays={overlays}
+          selected={safeIndex}
+          onSelect={selectOverlay}
+          onReorder={handleReorder}
+        />
         <div className="flex gap-2">
           <Button type="button" size="sm" variant="secondary" onClick={addOverlay} disabled={atCap}>
             Add text overlay
@@ -1070,9 +1473,32 @@ export default function SceneEditor({
             Limit reached: remove an overlay before adding another.
           </p>
         )}
+      </div>
+    </>
+  );
+
+  // Propiedades: the selected overlay's inspector (position/size/rotation/
+  // color). With no selection the panel shows guidance instead of dead
+  // controls (the preview's empty-space click deselects).
+  const inspectorPanel = (
+    <>
+      <div className="space-y-2">
+        <p className="text-sm font-medium">Propiedades</p>
+        {!selectedOverlay && !selectedBasePlacement && (
+          <p className="text-xs text-muted-foreground">
+            Select a Spotify content guide or scene overlay in Capas to edit its
+            properties.
+          </p>
+        )}
 
         {selectedOverlay && (
-          <div className="grid grid-cols-2 gap-3 rounded-md border p-3">
+          <motion.div
+            key={`overlay-card-${safeIndex}`}
+            initial={{ opacity: 0, y: 4 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.15 }}
+            className="grid grid-cols-2 gap-3 rounded-md border p-3"
+          >
             {selectedOverlay.kind === "text" && (
               <div className="col-span-2 space-y-1">
                 <Label htmlFor="overlay-text">Overlay text</Label>
@@ -1081,7 +1507,17 @@ export default function SceneEditor({
                   maxLength={SCENE_MAX_TEXT_CHARS}
                   value={selectedOverlay.text}
                   onChange={(e) => handleText(e.target.value)}
+                  {...validationProps(
+                    "overlay-text",
+                    validationIssues,
+                    [selectedOverlayPath("text")]
+                  )}
                 />
+                {validationMessage(
+                  "overlay-text",
+                  validationIssues,
+                  [selectedOverlayPath("text")]
+                )}
               </div>
             )}
             <div className="space-y-1">
@@ -1091,7 +1527,17 @@ export default function SceneEditor({
                 inputMode="decimal"
                 value={unitDrafts.x}
                 onChange={(e) => handleUnit("x", e.target.value)}
+                {...validationProps(
+                  "overlay-x",
+                  validationIssues,
+                  [selectedOverlayPath("x")]
+                )}
               />
+              {validationMessage(
+                "overlay-x",
+                validationIssues,
+                [selectedOverlayPath("x")]
+              )}
             </div>
             <div className="space-y-1">
               <Label htmlFor="overlay-y">Overlay Y (0-1)</Label>
@@ -1100,7 +1546,17 @@ export default function SceneEditor({
                 inputMode="decimal"
                 value={unitDrafts.y}
                 onChange={(e) => handleUnit("y", e.target.value)}
+                {...validationProps(
+                  "overlay-y",
+                  validationIssues,
+                  [selectedOverlayPath("y")]
+                )}
               />
+              {validationMessage(
+                "overlay-y",
+                validationIssues,
+                [selectedOverlayPath("y")]
+              )}
             </div>
             <div className="space-y-1">
               <Label htmlFor="overlay-size">Overlay size (0-1)</Label>
@@ -1109,7 +1565,17 @@ export default function SceneEditor({
                 inputMode="decimal"
                 value={unitDrafts.size}
                 onChange={(e) => handleUnit("size", e.target.value)}
+                {...validationProps(
+                  "overlay-size",
+                  validationIssues,
+                  [selectedOverlayPath("size")]
+                )}
               />
+              {validationMessage(
+                "overlay-size",
+                validationIssues,
+                [selectedOverlayPath("size")]
+              )}
             </div>
             <div className="space-y-1">
               <Label htmlFor="overlay-rotation">Overlay rotation (degrees)</Label>
@@ -1118,23 +1584,105 @@ export default function SceneEditor({
                 inputMode="decimal"
                 value={unitDrafts.rotation}
                 onChange={(e) => handleUnit("rotation", e.target.value)}
+                {...validationProps(
+                  "overlay-rotation",
+                  validationIssues,
+                  [selectedOverlayPath("rotation")]
+                )}
               />
+              {validationMessage(
+                "overlay-rotation",
+                validationIssues,
+                [selectedOverlayPath("rotation")]
+              )}
             </div>
             <div className="space-y-1">
               <Label htmlFor="overlay-color">Overlay color</Label>
-              <Input
-                id="overlay-color"
-                type="color"
-                value={
-                  HEX_COLOR.test(selectedOverlay.color) ? selectedOverlay.color : "#ffffff"
-                }
-                onChange={(e) => handleOverlayColor(e.target.value)}
-              />
+              {/* S7-T22: react-colorful swatch streams continuous onChange —
+                  pointer boundaries open the "color" coalescing owner, so
+                  ONE drag = ONE history entry + ONE debounced preview. The
+                  native field stays as the keyboard/typed-hex path. */}
+              <div
+                data-testid="overlay-color-gesture"
+                onPointerDown={beginColorGesture}
+                className="space-y-2"
+              >
+                <ColorPicker
+                  value={
+                    HEX_COLOR.test(selectedOverlay.color) ? selectedOverlay.color : "#ffffff"
+                  }
+                  onChange={handleOverlayColor}
+                  aria-label="Overlay color picker"
+                />
+                <Input
+                  id="overlay-color"
+                  type="color"
+                  value={
+                    HEX_COLOR.test(selectedOverlay.color) ? selectedOverlay.color : "#ffffff"
+                  }
+                  onChange={(e) => handleOverlayColor(e.target.value)}
+                  {...validationProps(
+                    "overlay-color",
+                    validationIssues,
+                    [selectedOverlayPath("color")]
+                  )}
+                />
+                {validationMessage(
+                  "overlay-color",
+                  validationIssues,
+                  [selectedOverlayPath("color")]
+                )}
+              </div>
             </div>
-          </div>
+          </motion.div>
+        )}
+
+        {selectedBase && selectedBasePlacement && (
+          <motion.div
+            key={`base-card-${selectedBase}`}
+            initial={{ opacity: 0, y: 4 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.15 }}
+            className="grid grid-cols-2 gap-3 rounded-md border p-3"
+          >
+            <div className="col-span-2 flex flex-col gap-1">
+              <p className="text-sm font-medium">
+                {BASE_WIDGET_META[selectedBase].label}
+              </p>
+              <p className="text-xs text-muted-foreground">
+                {BASE_WIDGET_META[selectedBase].description} The panel renders
+                the real content at this guide; the editor has no live Spotify
+                content.
+              </p>
+            </div>
+            {(["x", "y", "size"] as const).map((field) => {
+              const id = `base-${selectedBase}-${field}`;
+              const path = `basePlacements.${selectedBase}.${field}`;
+              return (
+                <div key={field} className="flex flex-col gap-1">
+                  <Label htmlFor={id}>{baseFieldLabel(selectedBase, field)}</Label>
+                  <Input
+                    id={id}
+                    inputMode="decimal"
+                    value={baseUnitDrafts[field]}
+                    onChange={(event) => handleBaseUnit(field, event.target.value)}
+                    {...validationProps(id, validationIssues, [path])}
+                  />
+                  {validationMessage(id, validationIssues, [path])}
+                </div>
+              );
+            })}
+          </motion.div>
         )}
       </div>
+    </>
+  );
 
+  // Main area (S7-T19): the live engine preview plus the persistence
+  // actions — both stay visible from EVERY rail section, so no control
+  // ever hides behind a tab.
+  const previewBlock = (
+    <>
       {/* Live preview: bytes rendered by the sidecar's engine on the panel.
           The overlay layer on top is GUIDANCE only — it composes no pixels;
           the PNG below it stays the single source of truth. The stage fixes
@@ -1144,102 +1692,21 @@ export default function SceneEditor({
         <p className="text-sm font-medium">Preview</p>
         <div className="flex aspect-[3/2] w-full items-center justify-center overflow-hidden rounded-md border bg-black/40">
           {previewUrl ? (
-            <div
-              ref={stageRef}
-              className="relative h-full aspect-[240/427] [container-type:size]"
-            >
-              <img
-                src={previewUrl}
-                alt="Scene preview"
-                className="absolute inset-0 h-full w-full"
-              />
-              <div
-                className="absolute inset-0 touch-none select-none"
-                onPointerDown={(e) => {
-                  // Empty space deselects; widget hits start their own gesture.
-                  if (e.target === e.currentTarget) setSelected(null);
-                }}
-              >
-                {overlays.map((overlay, index) => {
-                  const gesturing =
-                    gesture !== null && ghost !== null && gesture.index === index;
-                  const placement = gesturing && ghost ? ghost : overlay;
-                  const dxPx =
-                    gesturing && gesture
-                      ? (placement.x - overlay.x) * gesture.rect.width
-                      : 0;
-                  const dyPx =
-                    gesturing && gesture
-                      ? (placement.y - overlay.y) * gesture.rect.height
-                      : 0;
-                  const scale =
-                    gesturing && overlay.size > 0 ? placement.size / overlay.size : 1;
-                  const isSelected = safeIndex === index;
-                  return (
-                    <div
-                      key={`preview-overlay-${index}`}
-                      data-dragging={gesturing ? "true" : undefined}
-                      className="absolute"
-                      style={{
-                        left: `${overlay.x * 100}%`,
-                        top: `${overlay.y * 100}%`,
-                        height: `${overlay.size * 100}%`,
-                        transform: overlayBoxTransform(
-                          dxPx,
-                          dyPx,
-                          placement.rotation,
-                          scale
-                        ),
-                      }}
-                    >
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="ghost"
-                        aria-label={`Select overlay ${index + 1}`}
-                        aria-pressed={isSelected}
-                        className={`h-full rounded-sm border border-dashed px-1 ${
-                          isSelected ? "border-primary" : "border-white/50"
-                        }`}
-                        style={{
-                          // size is a fraction of canvas HEIGHT (the engine's
-                          // font_px = size * h); cqh expresses exactly that
-                          // against the size-container stage.
-                          fontSize: `${overlay.size * 100}cqh`,
-                          color: overlay.color,
-                        }}
-                        onPointerDown={(e) => beginGesture(index, "move", e)}
-                        onClick={() => setSelected(index)}
-                      >
-                        {/* gpu-temp has no renderer until S4-T15: an honest
-                            empty box, never phantom data. */}
-                        {overlay.kind === "text" ? overlay.text : ""}
-                      </Button>
-                      {isSelected && (
-                        <>
-                          <Button
-                            type="button"
-                            size="sm"
-                            variant="secondary"
-                            aria-label={`Resize overlay ${index + 1}`}
-                            className="absolute -bottom-1.5 -right-1.5 h-3 w-3 rounded-full p-0"
-                            onPointerDown={(e) => beginGesture(index, "resize", e)}
-                          />
-                          <Button
-                            type="button"
-                            size="sm"
-                            variant="secondary"
-                            aria-label={`Rotate overlay ${index + 1}`}
-                            className="absolute left-1/2 -top-1.5 h-3 w-3 -translate-x-1/2 rounded-full p-0"
-                            onPointerDown={(e) => beginGesture(index, "rotate", e)}
-                          />
-                        </>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
+            <SceneStage
+              previewUrl={previewUrl}
+              overlays={overlays}
+              basePlacements={basePlacements}
+              selected={selectedBase === null && safeIndex >= 0 ? safeIndex : null}
+              selectedBase={selectedBase}
+              onSelect={selectOverlay}
+              onSelectBase={selectBaseWidget}
+              onGestureBegin={handleGestureBegin}
+              onGestureMove={handleGestureMove}
+              onGestureEnd={handleGestureEnd}
+              onBaseGestureBegin={handleBaseGestureBegin}
+              onBaseGestureMove={handleBaseGestureMove}
+              onBaseGestureEnd={handleBaseGestureEnd}
+            />
           ) : (
             <p className="text-xs text-muted-foreground">Waiting for the panel…</p>
           )}
@@ -1254,7 +1721,11 @@ export default function SceneEditor({
           LyricVision holds the display.
         </p>
       </div>
+    </>
+  );
 
+  const saveBlock = (
+    <>
       <div className="flex flex-wrap items-center gap-2">
         <Button type="button" onClick={() => void handleSave()}>
           Save scene
@@ -1271,6 +1742,118 @@ export default function SceneEditor({
           {saveError}
         </p>
       )}
+    </>
+  );
+
+  const validationSummary =
+    validationIssues.length > 0 ? (
+      <div
+        role="alert"
+        aria-live="assertive"
+        className="rounded-md border border-destructive/40 p-3 text-sm"
+      >
+        <p className="font-medium">Scene needs attention.</p>
+        <ul className="list-disc space-y-1 pl-5">
+          {validationIssues.map((issue) => (
+            <li key={`${issue.path}:${issue.message}`}>
+              {issue.path}: {issue.message}
+            </li>
+          ))}
+        </ul>
+      </div>
+    ) : null;
+
+  const activeLabel =
+    SCENE_SECTIONS.find((item) => item.id === section)?.label ??
+    SCENE_SECTIONS[0].label;
+
+  return (
+    <div
+      className="flex items-start gap-4"
+      onKeyDown={handleEditorKeyDown}
+      onFocus={handleRootFocus}
+      onBlur={handleRootBlur}
+    >
+      {validationSummary}
+      {/* S7-T19 persistent rail: pick a section and edit immediately —
+          there is no enter/exit edit mode anymore. aria-pressed mirrors
+          the switch, the same pattern the background kind pills use. The
+          history row (S7-T20) shares this always-visible column: same
+          width, no layout redesign — and it sits OUTSIDE <nav> because
+          undo/redo are actions, not navigation landmarks. */}
+      <div className="flex w-32 shrink-0 flex-col">
+        <nav aria-label="Scene sections" className="flex flex-col gap-1">
+          {SCENE_SECTIONS.map((item) => (
+            <Button
+              key={item.id}
+              type="button"
+              size="sm"
+              variant={section === item.id ? "default" : "ghost"}
+              aria-pressed={section === item.id}
+              onClick={() => setSection(item.id)}
+              className="justify-start"
+            >
+              {item.label}
+            </Button>
+          ))}
+        </nav>
+        <div
+          className="mt-2 flex gap-1"
+          role="group"
+          aria-label="Scene history"
+        >
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="flex-1"
+            aria-label="Undo"
+            title="Undo (Ctrl+Z)"
+            disabled={!canUndo}
+            onClick={() => useSceneStore.getState().undo()}
+          >
+            <Undo2 className="h-4 w-4" aria-hidden="true" />
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="flex-1"
+            aria-label="Redo"
+            title="Redo (Ctrl+Shift+Z)"
+            disabled={!canRedo}
+            onClick={() => useSceneStore.getState().redo()}
+          >
+            <Redo2 className="h-4 w-4" aria-hidden="true" />
+          </Button>
+        </div>
+      </div>
+
+      {/* Panel column: exactly ONE panel is mounted at a time; motion
+          gives the swap a snappy 150 ms slide/fade (first user-visible
+          win of the motion migration). The region label tracks state. */}
+      <AnimatePresence mode="wait" initial={false}>
+        <motion.div
+          key={section}
+          role="region"
+          aria-label={activeLabel}
+          initial={{ opacity: 0, x: 8 }}
+          animate={{ opacity: 1, x: 0 }}
+          exit={{ opacity: 0, x: -8 }}
+          transition={{ duration: 0.15 }}
+          className="min-w-0 flex-1 space-y-4"
+        >
+          {section === "fondo" && fondoPanel}
+          {section === "capas" && capasPanel}
+          {section === "propiedades" && inspectorPanel}
+        </motion.div>
+      </AnimatePresence>
+
+      {/* Main area: live preview + Save/Reset, always visible. */}
+      <div className="flex min-w-0 flex-1 flex-col gap-4">
+        {previewBlock}
+        {saveBlock}
+      </div>
     </div>
   );
 }

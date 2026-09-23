@@ -172,7 +172,11 @@ SCENE_OVERLAYS_CAP = 32
 # pinned equal to the render cap by tests (test_protocol_text_cap_equals_
 # the_render_cap and tests/renderer/text-length-gate.test.ts).
 SCENE_MAX_TEXT_CHARS = 4096
-SCENE_KEYS = ("version", "background", "overlays")
+BASE_WIDGET_KEYS = ("cover", "title", "artist", "progress", "lyrics")
+BASE_PLACEMENT_KEYS = ("x", "y", "size")
+# S7-T24a is an optional, additive field under scene version 1 / wire v1.
+# Known version-skew risk: an older build rejects this unknown scene key.
+SCENE_KEYS = ("version", "background", "overlays", "basePlacements")
 PREVIEW_REQUEST_KEYS = ("v", "cmd", "reqId", "maxWidth", "maxHeight", "scene")
 
 _HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
@@ -215,7 +219,9 @@ def _reject(field: str, error: str) -> NoReturn:
     raise ProtocolError("invalid_request", f"{field}: {error}", field=field)
 
 
-def _first_unknown_key(value: Dict[str, Any], allowed: Tuple[str, ...]) -> Optional[str]:
+def _first_unknown_key(
+    value: Dict[str, Any], allowed: Tuple[str, ...]
+) -> Optional[str]:
     for key in value:
         if key not in allowed:
             return key
@@ -331,6 +337,32 @@ def _first_non_index_key(value: list) -> Optional[str]:
     return None
 
 
+def _validate_base_placement(value: Any, widget: str) -> Dict[str, Any]:
+    at = f"basePlacements.{widget}"
+    if not isinstance(value, dict):
+        _reject(at, "base placement must be an object")
+    unknown = _first_unknown_key(value, BASE_PLACEMENT_KEYS)
+    if unknown is not None:
+        _reject(f"{at}.{unknown}", f"unknown base placement key: {unknown}")
+    for axis in BASE_PLACEMENT_KEYS:
+        if not _is_unit_fraction(value.get(axis)):
+            _reject(f"{at}.{axis}", f"{axis} must be a fraction in [0,1]")
+    return {key: value.get(key) for key in BASE_PLACEMENT_KEYS}
+
+
+def _validate_base_placements(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        _reject("basePlacements", "basePlacements must be an object")
+    unknown = _first_unknown_key(value, BASE_WIDGET_KEYS)
+    if unknown is not None:
+        _reject(f"basePlacements.{unknown}", f"unknown base widget: {unknown}")
+    return {
+        widget: _validate_base_placement(value[widget], widget)
+        for widget in BASE_WIDGET_KEYS
+        if widget in value
+    }
+
+
 def _validate_overlay(value: Any, index: int) -> Dict[str, Any]:
     at = f"overlays[{index}]"
     if not isinstance(value, dict):
@@ -374,7 +406,7 @@ def validate_scene(value: Any) -> Dict[str, Any]:
     preview_request.scene crosses the process boundary and background.source
     later reaches a filesystem read — so it is re-checked here as untrusted
     input BEFORE anything downstream sees it. The two rule sets MUST stay in
-    lockstep: both suites consume tests/fixtures/scene-shapes.json (42 shapes
+    lockstep: both suites consume tests/fixtures/scene-shapes.json (49 shapes
     with explicit expect/field), so a rule change on one side fails the other
     side's suite instead of drifting silently.
 
@@ -401,7 +433,10 @@ def validate_scene(value: Any) -> Dict[str, Any]:
     if len(overlays) > SCENE_OVERLAYS_CAP:
         _reject("overlays", f"overlays exceeds the cap of {SCENE_OVERLAYS_CAP}")
     validated = [_validate_overlay(item, i) for i, item in enumerate(overlays)]
-    return {"version": version, "background": background, "overlays": validated}
+    result = {"version": version, "background": background, "overlays": validated}
+    if "basePlacements" in value:
+        result["basePlacements"] = _validate_base_placements(value["basePlacements"])
+    return result
 
 
 def validate_preview_request(payload: Any) -> Dict[str, Any]:
@@ -430,7 +465,10 @@ def validate_preview_request(payload: Any) -> Dict[str, Any]:
     if isinstance(req_id, bool) or not isinstance(req_id, int) or req_id < 1:
         _reject("reqId", "reqId must be a positive integer")
     sizes: Dict[str, int] = {}
-    for key, cap in (("maxWidth", PREVIEW_MAX_WIDTH), ("maxHeight", PREVIEW_MAX_HEIGHT)):
+    for key, cap in (
+        ("maxWidth", PREVIEW_MAX_WIDTH),
+        ("maxHeight", PREVIEW_MAX_HEIGHT),
+    ):
         size = payload.get(key)
         if isinstance(size, bool) or not isinstance(size, int) or not 1 <= size <= cap:
             _reject(key, f"{key} must be an integer in [1,{cap}]")
@@ -463,10 +501,20 @@ def build_preview_response(
         raise ValueError("preview image must be a non-empty base64 string")
     if media_type not in PREVIEW_MEDIA_TYPES:
         raise ValueError(f"unsupported preview media type: {media_type!r}")
-    if not isinstance(width, int) or isinstance(width, bool) or not 1 <= width <= PREVIEW_MAX_WIDTH:
+    if (
+        not isinstance(width, int)
+        or isinstance(width, bool)
+        or not 1 <= width <= PREVIEW_MAX_WIDTH
+    ):
         raise ValueError(f"preview width must be an integer in [1,{PREVIEW_MAX_WIDTH}]")
-    if not isinstance(height, int) or isinstance(height, bool) or not 1 <= height <= PREVIEW_MAX_HEIGHT:
-        raise ValueError(f"preview height must be an integer in [1,{PREVIEW_MAX_HEIGHT}]")
+    if (
+        not isinstance(height, int)
+        or isinstance(height, bool)
+        or not 1 <= height <= PREVIEW_MAX_HEIGHT
+    ):
+        raise ValueError(
+            f"preview height must be an integer in [1,{PREVIEW_MAX_HEIGHT}]"
+        )
     return {
         "v": PROTOCOL_VERSION,
         "cmd": CMD_PREVIEW_RESPONSE,

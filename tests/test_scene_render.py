@@ -38,13 +38,22 @@ GREEN = (0, 255, 0)
 # Helpers
 # --------------------------------------------------------------------------
 
+
 def render(scene, media_root):
     return lcd_bridge.render_scene(scene, media_root=str(media_root))
 
 
 def image_bg(source, **overrides):
-    bg = {"kind": "image", "source": source, "rotation": 0, "flipH": False,
-          "scale": 1, "panX": 0, "panY": 0, "fit": "fit"}
+    bg = {
+        "kind": "image",
+        "source": source,
+        "rotation": 0,
+        "flipH": False,
+        "scale": 1,
+        "panX": 0,
+        "panY": 0,
+        "fit": "fit",
+    }
     bg.update(overrides)
     return {"version": 1, "background": bg, "overlays": []}
 
@@ -54,8 +63,15 @@ def scene_of(background, overlays=None):
 
 
 def text_overlay(**overrides):
-    overlay = {"kind": "text", "text": "Hi", "x": 0.5, "y": 0.5,
-               "size": 0.1, "rotation": 0, "color": "#ff0000"}
+    overlay = {
+        "kind": "text",
+        "text": "Hi",
+        "x": 0.5,
+        "y": 0.5,
+        "size": 0.1,
+        "rotation": 0,
+        "color": "#ff0000",
+    }
     overlay.update(overrides)
     return overlay
 
@@ -98,6 +114,7 @@ def ink_center(img):
 # Backgrounds: none / color
 # --------------------------------------------------------------------------
 
+
 def test_background_none_is_transparent(tmp_path):
     img = render(scene_of({"kind": "none"}), tmp_path)
     assert img.size == GLASS
@@ -123,6 +140,7 @@ def test_background_color_fills_known_pixels(tmp_path):
 # --------------------------------------------------------------------------
 # Background image: fit / fill, rotation, flip, scale, pan
 # --------------------------------------------------------------------------
+
 
 def test_image_fit_letterboxes_and_fill_covers(tmp_path):
     save_png(Image.new("RGB", (200, 100), GREEN), tmp_path, "letter.png")
@@ -199,6 +217,7 @@ def test_pan_y_shifts_image_in_canvas_space(tmp_path):
 # Text overlays
 # --------------------------------------------------------------------------
 
+
 def test_text_lands_centered_and_moves_with_x(tmp_path):
     scene = scene_of({"kind": "none"}, [text_overlay(x=0.5, y=0.5)])
     cx, cy = ink_center(render(scene, tmp_path))
@@ -234,10 +253,18 @@ def test_text_rotation_reorients_the_ink(tmp_path):
 # Determinism
 # --------------------------------------------------------------------------
 
+
 def test_same_scene_twice_yields_byte_identical_png(tmp_path):
     save_png(Image.new("RGB", (100, 100), RED), tmp_path, "solid.png")
-    bg = image_bg("solid.png", fit="fill", rotation=37, flipH=True,
-                  scale=1.3, panX=0.1, panY=-0.05)["background"]
+    bg = image_bg(
+        "solid.png",
+        fit="fill",
+        rotation=37,
+        flipH=True,
+        scale=1.3,
+        panX=0.1,
+        panY=-0.05,
+    )["background"]
     scene = scene_of(
         bg,
         [text_overlay(text="Determinism", rotation=15, x=0.3, y=0.7)],
@@ -255,6 +282,7 @@ def test_same_scene_twice_yields_byte_identical_png(tmp_path):
 # Media-root containment
 # --------------------------------------------------------------------------
 
+
 def test_media_inside_root_loads(tmp_path):
     save_png(Image.new("RGB", (100, 100), RED), tmp_path, "inside.png")
     img = render(image_bg("inside.png", fit="fit"), tmp_path)
@@ -265,11 +293,11 @@ def test_sources_outside_media_root_are_refused(tmp_path):
     root = tmp_path / "media"
     root.mkdir()
     escapes = [
-        r"C:\Windows\win.ini",           # absolute Windows path
-        "/etc/passwd",                    # absolute POSIX path
-        r"\\server\share\x.png",          # UNC path
-        "file:///C:/x.png",               # file:// URL
-        "C:",                             # drive-relative
+        r"C:\Windows\win.ini",  # absolute Windows path
+        "/etc/passwd",  # absolute POSIX path
+        r"\\server\share\x.png",  # UNC path
+        "file:///C:/x.png",  # file:// URL
+        "C:",  # drive-relative
     ]
     for source in escapes:
         with pytest.raises(lcd_bridge.SceneRenderError) as exc:
@@ -299,12 +327,16 @@ def test_symlink_escape_is_refused(tmp_path):
         try:
             proc = subprocess.run(
                 ["cmd", "/c", "mklink", "/J", str(junction), str(outside_dir)],
-                capture_output=True, text=True, timeout=30,
+                capture_output=True,
+                text=True,
+                timeout=30,
             )
             if proc.returncode == 0:
                 source = "lnk/outside.png"
             else:
-                problems.append(f"mklink /J rc={proc.returncode}: {proc.stderr.strip()}")
+                problems.append(
+                    f"mklink /J rc={proc.returncode}: {proc.stderr.strip()}"
+                )
         except OSError as exc2:
             problems.append(f"mklink /J: {exc2}")
     if source is None:
@@ -356,7 +388,7 @@ def test_undecodable_media_is_typed(tmp_path):
     cases = [
         "data:image/png;base64,iVBORw0KGgo=",  # valid b64, truncated PNG
         "data:image/png;base64,***not-b64***",  # invalid b64
-        "data:image/png;base64",                 # missing ',' separator
+        "data:image/png;base64",  # missing ',' separator
     ]
     for source in cases:
         with pytest.raises(lcd_bridge.SceneRenderError) as exc:
@@ -367,6 +399,7 @@ def test_undecodable_media_is_typed(tmp_path):
 # --------------------------------------------------------------------------
 # Unsupported vs invalid
 # --------------------------------------------------------------------------
+
 
 # gif is implemented since S1-T5 (see tests/test_scene_gif.py); video stays
 # unsupported until S3-T12 and must be checked BEFORE the source is touched.
@@ -379,10 +412,19 @@ def test_unsupported_background_kind_is_typed(kind, tmp_path):
 
 
 def test_gpu_temp_overlay_is_typed_unsupported(tmp_path):
-    scene = scene_of({"kind": "none"}, [
-        {"kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 0.1,
-         "rotation": 0, "color": "#ffffff"},
-    ])
+    scene = scene_of(
+        {"kind": "none"},
+        [
+            {
+                "kind": "gpu-temp",
+                "x": 0.5,
+                "y": 0.5,
+                "size": 0.1,
+                "rotation": 0,
+                "color": "#ffffff",
+            },
+        ],
+    )
     with pytest.raises(lcd_bridge.SceneRenderError) as exc:
         render(scene, tmp_path)
     assert exc.value.reason == "unsupported_overlay"
@@ -426,6 +468,7 @@ CORPUS_VALID_OUTCOMES = {
     "source-smile-double-dot": "media_missing",
     "source-data-uri": "media_unreadable",
     "overlays-at-cap": "unsupported_overlay",
+    "base-placements-valid": "render",
 }
 
 
@@ -450,10 +493,7 @@ def test_shared_corpus_invalid_shapes_fail_validation(tmp_path):
         shapes = json.load(handle)["shapes"]
     # "materialize" shapes are valid as plain JSON; their invalidity only
     # exists after JS/Python-specific mutations covered by the S0-T1 suites.
-    invalid = [
-        s for s in shapes
-        if s["expect"] == "invalid" and "materialize" not in s
-    ]
+    invalid = [s for s in shapes if s["expect"] == "invalid" and "materialize" not in s]
     assert invalid, "corpus must pin invalid shapes"
     for shape in invalid:
         with pytest.raises(ProtocolError) as exc:
@@ -465,6 +505,7 @@ def test_shared_corpus_invalid_shapes_fail_validation(tmp_path):
 # --------------------------------------------------------------------------
 # Text-length defence in depth (S2-T8c)
 # --------------------------------------------------------------------------
+
 
 def test_render_refuses_overlong_text_before_drawing(tmp_path):
     """render_scene validates FIRST (lcd_bridge.render_scene -> validate_scene),

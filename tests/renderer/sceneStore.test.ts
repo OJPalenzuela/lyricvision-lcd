@@ -48,20 +48,7 @@ beforeEach(() => {
 
 describe("scene store actions (state shape pinned)", () => {
   it("exposes exactly the scene data and the action surface", () => {
-    expect(Object.keys(state()).sort()).toEqual([
-      "addOverlay",
-      "hydrate",
-      "markSaved",
-      "redo",
-      "removeOverlay",
-      "resetToSaved",
-      "savedScene",
-      "scene",
-      "setBackground",
-      "setScene",
-      "undo",
-      "updateOverlay",
-    ]);
+    expect(Object.keys(state()).sort()).toEqual(["addOverlay", "hydrate", "markSaved", "redo", "removeOverlay", "reorderOverlays", "resetToSaved", "savedScene", "scene", "setBackground", "setScene", "undo", "updateOverlay"]);
   });
 
   it("setScene replaces the whole scene and records one history entry", () => {

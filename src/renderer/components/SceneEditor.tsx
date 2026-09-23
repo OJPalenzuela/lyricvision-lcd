@@ -9,9 +9,11 @@ import {
 import { Redo2, Undo2 } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
 
+import LayersList from "@/components/LayersList";
 import SceneStage, { type OverlayPlacement } from "@/components/SceneStage";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
+import { ColorPicker } from "@/components/ui/color-picker";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { errMessage, type LyricvisionBridge } from "@/lib/bridge";
@@ -72,6 +74,24 @@ import { useCanRedo, useCanUndo, useSceneStore } from "@/lib/sceneStore";
 const PREVIEW_DEBOUNCE_MS = 250;
 const HEX_COLOR = /^#[0-9a-fA-F]{6}$/;
 const COLOR_FALLBACK = "#000000";
+const SHORT_HEX = /^#[0-9a-fA-F]{3}$/;
+
+/**
+ * Accept the canonical #rrggbb form plus react-colorful's possible #abc
+ * shorthand, always committing the canonical 6-digit shape the validator
+ * requires. Reject, never coerce: an unparseable value returns null and
+ * commits NOTHING.
+ */
+function normalizeHexColor(raw: string): string | null {
+  if (HEX_COLOR.test(raw)) return raw;
+  if (SHORT_HEX.test(raw)) {
+    return `#${raw[1]}${raw[1]}${raw[2]}${raw[2]}${raw[3]}${raw[3]}`;
+  }
+  return null;
+}
+
+/** Coalescing session owners: S7-T21 drag/field, S7-T22 color. */
+type CoalesceOwner = "drag" | "field" | "color";
 
 type UnitField = "x" | "y" | "size" | "rotation";
 type TransformField = "rotation" | "scale" | "panX" | "panY";
@@ -353,7 +373,7 @@ export default function SceneEditor({
   const [section, setSection] = useState<SceneSectionId>("fondo");
   // S7-T21 gesture coalescing (see file header): history is paused for the
   // whole gesture and exactly one entry is written when it ends.
-  const coalescing = useRef<{ owner: "drag" | "field"; snapshot: Scene } | null>(
+  const coalescing = useRef<{ owner: CoalesceOwner; snapshot: Scene } | null>(
     null
   );
   // Live gestures commit scene values (that is what makes coalescing
@@ -362,8 +382,22 @@ export default function SceneEditor({
   const gestureActive = useRef(false);
   // Which editable field owns the current coalescing session (focus -> blur).
   const focusedField = useRef<string | null>(null);
+  // S7-T22 color-gesture state (react-colorful): one pointer press opens an
+  // owner-tagged "color" session; the snapshot tells release whether ANY
+  // value actually changed (a tap that re-emits the current color must
+  // record nothing — the snapshot === scene branch stays honored).
+  const colorGestureActive = useRef(false);
+  const colorGestureSnapshot = useRef<Scene | null>(null);
+  // Window-level release listeners capture their closure at REGISTRATION
+  // time, so they call through this ref — refreshed on every render — to
+  // reach the latest endColorGesture (fresh scene/endCoalesce/schedulePreview).
+  const colorReleaseRef = useRef<() => void>(() => {});
 
-  const endCoalesce = (owner: "drag" | "field"): void => {
+  const handleWindowRelease = useCallback(() => {
+    colorReleaseRef.current();
+  }, []);
+
+  const endCoalesce = (owner: CoalesceOwner): void => {
     const active = coalescing.current;
     if (!active || active.owner !== owner) return;
     coalescing.current = null;
@@ -378,7 +412,7 @@ export default function SceneEditor({
     onSceneChange(scene); // final value -> exactly ONE history entry
   };
 
-  const beginCoalesce = (owner: "drag" | "field", snapshot: Scene): void => {
+  const beginCoalesce = (owner: CoalesceOwner, snapshot: Scene): void => {
     if (coalescing.current?.owner === owner) return; // already coalescing
     // Defensive: another session is still open (its blur may not have
     // arrived). Close it first so its edits get their own single entry.
@@ -387,9 +421,52 @@ export default function SceneEditor({
     useSceneStore.temporal.getState().pause();
   };
 
-  // Unmount mid-gesture must never leave history frozen.
+  /**
+   * S7-T22 color gesture (react-colorful): pointer boundaries open/close the
+   * "color" coalescing session, so ONE pointer press = ONE history entry no
+   * matter how many onChange values stream mid-gesture. The release listener
+   * also lives on `window` because a pointer can be released OUTSIDE the
+   * wrapper; live commits stay gated (gestureActive) so the panel sees
+   * exactly ONE debounced preview after the gesture, from the same 250 ms
+   * source as every other edit.
+   */
+  const beginColorGesture = (): void => {
+    if (colorGestureActive.current) return;
+    colorGestureActive.current = true;
+    colorGestureSnapshot.current = scene;
+    gestureActive.current = true; // suppress previews until the release
+    beginCoalesce("color", scene);
+    window.addEventListener("pointerup", handleWindowRelease);
+    window.addEventListener("pointercancel", handleWindowRelease);
+  };
+
+  const endColorGesture = (): void => {
+    if (!colorGestureActive.current) return;
+    colorGestureActive.current = false;
+    window.removeEventListener("pointerup", handleWindowRelease);
+    window.removeEventListener("pointercancel", handleWindowRelease);
+    const startedAt = colorGestureSnapshot.current;
+    colorGestureSnapshot.current = null;
+    const changed = startedAt !== scene; // any live commit rebuilt the scene
+    gestureActive.current = false; // unblock previews BEFORE the final commit
+    endCoalesce("color");
+    if (changed) schedulePreview(scene); // ONE debounced push, single source
+  };
+
+  // Refresh the window-release target every render (see colorReleaseRef).
+  useEffect(() => {
+    colorReleaseRef.current = endColorGesture;
+  });
+
+  // Unmount mid-gesture must never leave history frozen OR window listeners
+  // attached to a dead component.
   useEffect(
     () => () => {
+      if (colorGestureActive.current) {
+        colorGestureActive.current = false;
+        window.removeEventListener("pointerup", handleWindowRelease);
+        window.removeEventListener("pointercancel", handleWindowRelease);
+      }
       if (coalescing.current) {
         coalescing.current = null;
         useSceneStore.temporal.getState().resume();
@@ -575,6 +652,31 @@ export default function SceneEditor({
   };
 
   /**
+   * S7-T22 dnd-kit commit (Capas): the DROP mutates the array through the
+   * store — one `set` in sceneStore.reorderOverlays IS the single history
+   * entry (no commits exist during the drag, so there is nothing to
+   * coalesce), and the [scene] effect arms the usual ONE debounced preview.
+   *
+   * SELECTION STABILITY (index → identity, CRITICAL): selection is an
+   * index, and a reorder SHIFTS indices. The selected overlay OBJECT is
+   * captured before the move and re-found by reference (`indexOf`) after —
+   * the selection follows the same overlay, and SceneStage's positional
+   * `overlay-N` ids / handles (re-derived from the array on every render)
+   * therefore land on the right objects.
+   */
+  const handleReorder = (from: number, to: number): void => {
+    if (from === to) return;
+    if (from < 0 || from >= overlays.length) return;
+    if (to < 0 || to >= overlays.length) return;
+    const anchor = safeIndex >= 0 ? overlays[safeIndex] ?? null : null;
+    useSceneStore.getState().reorderOverlays(from, to);
+    if (!anchor) return;
+    const next = useSceneStore.getState().scene.overlays;
+    const newIndex = next.indexOf(anchor);
+    if (newIndex >= 0 && newIndex !== safeIndex) setSelected(newIndex);
+  };
+
+  /**
    * Field coalescing at the editor ROOT: focusin/focusout bubble, so one
    * pair of handlers covers every inspector input instead of wiring each
    * control. Editable targets only (same gate as the Ctrl+Z handler), keyed
@@ -665,11 +767,29 @@ export default function SceneEditor({
   };
 
   const handleOverlayColor = (raw: string) => {
-    if (!HEX_COLOR.test(raw)) return;
-    const overlaysNext = overlays.map((overlay, i) =>
-      i === safeIndex ? { ...overlay, color: raw } : overlay
+    // Reject, never coerce: only canonical #rrggbb (plus react-colorful's
+    // possible #abc shorthand, expanded) ever reaches the scene.
+    const hex = normalizeHexColor(raw);
+    if (!hex) return;
+    const overlay = safeIndex >= 0 ? overlays[safeIndex] : undefined;
+    // Same-value guard (S7-T22): a tap that re-emits the current color must
+    // not rebuild the scene — with no commit, snapshot === scene at release
+    // and endCoalesce records ZERO entries for a gesture that changed nothing.
+    if (!overlay || overlay.color === hex) return;
+    const overlaysNext = overlays.map((item, i) =>
+      i === safeIndex ? { ...item, color: hex } : item
     );
     commitOverlays(overlaysNext);
+    setSavedNote(null);
+  };
+
+  const handleBackgroundColor = (raw: string) => {
+    const hex = normalizeHexColor(raw);
+    if (!hex) return;
+    if (scene.background.kind === "color" && scene.background.color === hex) {
+      return;
+    }
+    onSceneChange({ ...scene, background: { kind: "color", color: hex } });
     setSavedNote(null);
   };
 
@@ -856,17 +976,27 @@ export default function SceneEditor({
         {scene.background.kind === "color" && (
           <div className="space-y-1">
             <Label htmlFor="scene-background-color">Background color</Label>
-            <Input
-              id="scene-background-color"
-              type="color"
-              value={HEX_COLOR.test(backgroundColor) ? backgroundColor : COLOR_FALLBACK}
-              onChange={(e) => {
-                const value = e.target.value;
-                if (!HEX_COLOR.test(value)) return;
-                onSceneChange({ ...scene, background: { kind: "color", color: value } });
-                setSavedNote(null);
-              }}
-            />
+            {/* S7-T22: react-colorful swatch (pointer gesture, coalesced
+                through the "color" owner) + the native field (typed hex /
+                keyboard) — two doors into the SAME existing
+                background.color field, gated by ONE handler. */}
+            <div
+              data-testid="background-color-gesture"
+              onPointerDown={beginColorGesture}
+              className="space-y-2"
+            >
+              <ColorPicker
+                value={HEX_COLOR.test(backgroundColor) ? backgroundColor : COLOR_FALLBACK}
+                onChange={handleBackgroundColor}
+                aria-label="Background color picker"
+              />
+              <Input
+                id="scene-background-color"
+                type="color"
+                value={HEX_COLOR.test(backgroundColor) ? backgroundColor : COLOR_FALLBACK}
+                onChange={(e) => handleBackgroundColor(e.target.value)}
+              />
+            </div>
           </div>
         )}
         {mediaBackground && (
@@ -974,28 +1104,20 @@ export default function SceneEditor({
     </>
   );
 
-  // Capas: the overlay list — select/add/remove (reorder via dnd-kit is
-  // S7-T22). The numeric inspector moved to the Propiedades section.
+  // Capas (S7-T22): the overlay list with dnd-kit sortable rows — select via
+  // the row button, reorder via the drag handle (pointer or keyboard). The
+  // row order IS scene.overlays order = the sidecar paint order (z-order).
   const capasPanel = (
     <>
       {/* Text overlays: rows select; the selected one is edited in the
           Propiedades section. */}
       <div className="space-y-2">
-        <p className="text-sm font-medium">Text overlays</p>
-        <div className="flex flex-wrap gap-2">
-          {overlays.map((overlay, index) => (
-            <Button
-              key={`overlay-row-${index}`}
-              type="button"
-              size="sm"
-              variant={safeIndex === index ? "default" : "outline"}
-              aria-pressed={safeIndex === index}
-              onClick={() => setSelected(index)}
-            >
-              {`Overlay ${index + 1}`}
-            </Button>
-          ))}
-        </div>
+        <LayersList
+          overlays={overlays}
+          selected={safeIndex}
+          onSelect={setSelected}
+          onReorder={handleReorder}
+        />
         <div className="flex gap-2">
           <Button type="button" size="sm" variant="secondary" onClick={addOverlay} disabled={atCap}>
             Add text overlay
@@ -1034,7 +1156,13 @@ export default function SceneEditor({
         )}
 
         {selectedOverlay && (
-          <div className="grid grid-cols-2 gap-3 rounded-md border p-3">
+          <motion.div
+            key={`overlay-card-${safeIndex}`}
+            initial={{ opacity: 0, y: 4 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.15 }}
+            className="grid grid-cols-2 gap-3 rounded-md border p-3"
+          >
             {selectedOverlay.kind === "text" && (
               <div className="col-span-2 space-y-1">
                 <Label htmlFor="overlay-text">Overlay text</Label>
@@ -1084,16 +1212,33 @@ export default function SceneEditor({
             </div>
             <div className="space-y-1">
               <Label htmlFor="overlay-color">Overlay color</Label>
-              <Input
-                id="overlay-color"
-                type="color"
-                value={
-                  HEX_COLOR.test(selectedOverlay.color) ? selectedOverlay.color : "#ffffff"
-                }
-                onChange={(e) => handleOverlayColor(e.target.value)}
-              />
+              {/* S7-T22: react-colorful swatch streams continuous onChange —
+                  pointer boundaries open the "color" coalescing owner, so
+                  ONE drag = ONE history entry + ONE debounced preview. The
+                  native field stays as the keyboard/typed-hex path. */}
+              <div
+                data-testid="overlay-color-gesture"
+                onPointerDown={beginColorGesture}
+                className="space-y-2"
+              >
+                <ColorPicker
+                  value={
+                    HEX_COLOR.test(selectedOverlay.color) ? selectedOverlay.color : "#ffffff"
+                  }
+                  onChange={handleOverlayColor}
+                  aria-label="Overlay color picker"
+                />
+                <Input
+                  id="overlay-color"
+                  type="color"
+                  value={
+                    HEX_COLOR.test(selectedOverlay.color) ? selectedOverlay.color : "#ffffff"
+                  }
+                  onChange={(e) => handleOverlayColor(e.target.value)}
+                />
+              </div>
             </div>
-          </div>
+          </motion.div>
         )}
       </div>
     </>

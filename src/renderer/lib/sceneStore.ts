@@ -57,6 +57,8 @@ interface SceneStoreState {
   setScene(next: Scene): void;
   /** Patch one overlay's shared placement (x/y/size/rotation/color). */
   updateOverlay(index: number, patch: Partial<OverlayPlacement>): void;
+  /** Move the overlay at `from` to index `to` (exactly one history entry). */
+  reorderOverlays(from: number, to: number): void;
   /** Append an overlay (defaults to the standard new text overlay). */
   addOverlay(overlay?: Overlay): void;
   /** Remove the overlay at `index` (out of range = no-op). */
@@ -119,6 +121,25 @@ export const useSceneStore = create<SceneStoreState>()(
               ),
             },
           };
+        }),
+
+      // S7-T22: ONE `set` per drop = ONE zundo entry, so a dnd-kit reorder
+      // undoes as a single step. Indices validate against the CURRENT array —
+      // the layers list uses positional ids and never mutates the array
+      // during a drag, so the drop's from/to always resolve here. Same-index
+      // and out-of-range calls are typed no-ops (no new reference = no entry).
+      reorderOverlays: (from, to) =>
+        set((state) => {
+          const overlays = state.scene.overlays;
+          if (from === to) return {};
+          if (from < 0 || from >= overlays.length) return {};
+          if (to < 0 || to >= overlays.length) return {};
+          const moved = overlays[from];
+          if (!moved) return {};
+          const next = overlays.slice();
+          next.splice(from, 1);
+          next.splice(to, 0, moved);
+          return { scene: { ...state.scene, overlays: next } };
         }),
 
       addOverlay: (overlay) =>

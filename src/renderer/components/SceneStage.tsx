@@ -11,7 +11,19 @@ import {
 import useImage from "use-image";
 import type Konva from "konva";
 
-import type { Scene } from "@/lib/scene";
+import {
+  BASE_WIDGET_META,
+  MIN_BASE_WIDGET_SIZE,
+  PORTRAIT_HEIGHT,
+  PORTRAIT_WIDTH,
+  type ResolvedBasePlacements,
+} from "@/lib/basePlacements";
+import {
+  BASE_WIDGET_KEYS,
+  type BasePlacement,
+  type BaseWidget,
+  type Scene,
+} from "@/lib/scene";
 
 /**
  * S7-T21 — the editor canvas, rebuilt on Konva/react-konva. It replaces the
@@ -26,7 +38,9 @@ import type { Scene } from "@/lib/scene";
  *
  * SPACE: nodes are authored in logical GLASS/portrait space (480×854) and the
  * Stage is scaled to the measured container, so every node coordinate is a
- * pure function of the scene (x*480, y*854, size*854).
+ * pure function of the scene. Base-widget size uses the centralized
+ * BASE_WIDGET_META unit: width widgets scale by PORTRAIT_WIDTH and height
+ * widgets scale by PORTRAIT_HEIGHT.
  *
  * JSDOM SEAM (honest): jsdom ships no canvas backend, so there is no hit
  * graph to trust in tests. Tests reach the stage through the module-level
@@ -47,15 +61,15 @@ export interface OverlayPlacement {
 }
 
 /** Logical portrait space — the glass the engine renders into (registry rotates later). */
-const GLASS_WIDTH = 480;
-const GLASS_HEIGHT = 854;
+const GLASS_WIDTH = PORTRAIT_WIDTH;
+const GLASS_HEIGHT = PORTRAIT_HEIGHT;
 
 /**
  * Gesture-time floor for resize. The validator accepts size in [0,1], but a
  * 0-size widget is invisible and ungrabbable, so the drag clamps at 0.01 —
  * still inside the validator's range.
  */
-const MIN_OVERLAY_SIZE = 0.01;
+const MIN_OVERLAY_SIZE = MIN_BASE_WIDGET_SIZE;
 
 /** Declared overlay rotation range — inspector and rotation handle share it. */
 const OVERLAY_ROTATION_RANGE: readonly [number, number] = [-360, 360];
@@ -100,6 +114,19 @@ interface GestureState {
   originY: number;
   originSize: number;
   originRotation: number;
+}
+
+export type BaseGestureMode = "move" | "resize";
+
+interface BaseGestureState {
+  widget: BaseWidget;
+  mode: BaseGestureMode;
+  startClientX: number;
+  startClientY: number;
+  clientX: number;
+  clientY: number;
+  rect: StageRect;
+  origin: BasePlacement;
 }
 
 type StageOverlay = Scene["overlays"][number];
@@ -169,6 +196,77 @@ function gesturePlacement(g: GestureState): OverlayPlacement {
   };
 }
 
+function baseGesturePlacement(gesture: BaseGestureState): BasePlacement {
+  const dx = gesture.clientX - gesture.startClientX;
+  const dy = gesture.clientY - gesture.startClientY;
+  if (gesture.mode === "move") {
+    const dxPx = clampNumber(
+      dx,
+      -gesture.origin.x * gesture.rect.width,
+      (1 - gesture.origin.x) * gesture.rect.width
+    );
+    const dyPx = clampNumber(
+      dy,
+      -gesture.origin.y * gesture.rect.height,
+      (1 - gesture.origin.y) * gesture.rect.height
+    );
+    return {
+      ...gesture.origin,
+      x: clampNumber(gesture.origin.x + dxPx / gesture.rect.width, 0, 1),
+      y: clampNumber(gesture.origin.y + dyPx / gesture.rect.height, 0, 1),
+    };
+  }
+  const delta =
+    BASE_WIDGET_META[gesture.widget].sizeUnit === "width"
+      ? dx / gesture.rect.width
+      : dy / gesture.rect.height;
+  return {
+    ...gesture.origin,
+    size: clampNumber(
+      gesture.origin.size + delta,
+      MIN_BASE_WIDGET_SIZE,
+      1
+    ),
+  };
+}
+
+function baseGuideBox(
+  widget: BaseWidget,
+  placement: BasePlacement
+): { width: number; height: number } {
+  const sizeUnit = BASE_WIDGET_META[widget].sizeUnit;
+  const size =
+    placement.size * (sizeUnit === "width" ? GLASS_WIDTH : GLASS_HEIGHT);
+  if (sizeUnit === "width") {
+    return widget === "cover"
+      ? { width: size, height: size }
+      : { width: size, height: 8 };
+  }
+  const height =
+    widget === "title"
+      ? Math.max(40, size * 2)
+      : widget === "artist"
+        ? Math.max(48, size * 2.5)
+        : Math.max(96, size * 3.5);
+  return { width: GLASS_WIDTH - 56, height };
+}
+
+function baseResizeHandle(
+  widget: BaseWidget,
+  placement: BasePlacement,
+  box: { width: number; height: number }
+): { x: number; y: number } {
+  const centerX = placement.x * GLASS_WIDTH;
+  const centerY = placement.y * GLASS_HEIGHT;
+  if (widget === "cover") {
+    return { x: centerX + box.width / 2, y: centerY + box.height / 2 };
+  }
+  if (widget === "progress") {
+    return { x: centerX + box.width / 2, y: centerY };
+  }
+  return { x: centerX, y: centerY + box.height / 2 };
+}
+
 /**
  * Handle anchors in STAGE space: the guide box rotates around its center, so
  * each handle is its unrotated offset rotated by the scene's degrees
@@ -204,28 +302,41 @@ function handlePositions(overlay: StageOverlay): {
 interface SceneStageProps {
   previewUrl: string;
   overlays: Scene["overlays"];
+  basePlacements: ResolvedBasePlacements;
   /** Index of the selected overlay (already clamped by SceneEditor), or null. */
   selected: number | null;
+  selectedBase: BaseWidget | null;
   onSelect: (index: number | null) => void;
+  onSelectBase: (widget: BaseWidget | null) => void;
   onGestureBegin: (index: number, mode: GestureMode) => void;
   onGestureMove: (index: number, placement: OverlayPlacement) => void;
   onGestureEnd: () => void;
+  onBaseGestureBegin: (widget: BaseWidget, mode: BaseGestureMode) => void;
+  onBaseGestureMove: (widget: BaseWidget, placement: BasePlacement) => void;
+  onBaseGestureEnd: () => void;
 }
 
 export default function SceneStage({
   previewUrl,
   overlays,
+  basePlacements,
   selected,
+  selectedBase,
   onSelect,
+  onSelectBase,
   onGestureBegin,
   onGestureMove,
   onGestureEnd,
+  onBaseGestureBegin,
+  onBaseGestureMove,
+  onBaseGestureEnd,
 }: SceneStageProps) {
   const wrapperRef = useRef<HTMLDivElement | null>(null);
   const stageRef = useRef<Konva.Stage | null>(null);
   // Gesture bookkeeping: the ref is the source of truth for the drag
   // callbacks (no stale closures); state only flags the wrapper for tests.
   const gestureRef = useRef<GestureState | null>(null);
+  const baseGestureRef = useRef<BaseGestureState | null>(null);
   const [scale, setScale] = useState(FALLBACK_SCALE);
   const [dragging, setDragging] = useState(false);
   const [image, status] = useImage(previewUrl);
@@ -305,9 +416,65 @@ export default function SceneStage({
     onGestureEnd();
   };
 
+  const startBaseGesture = (
+    widget: BaseWidget,
+    mode: BaseGestureMode,
+    event: { evt: Event }
+  ): void => {
+    const pointer = event.evt as MouseEvent;
+    if (typeof pointer.button === "number" && pointer.button !== 0) return;
+    if (!Number.isFinite(pointer.clientX) || !Number.isFinite(pointer.clientY)) return;
+    const element = wrapperRef.current;
+    const placement = basePlacements[widget];
+    if (!element || !placement) return;
+    const rect = element.getBoundingClientRect();
+    if (!(rect.width > 0) || !(rect.height > 0)) return;
+    baseGestureRef.current = {
+      widget,
+      mode,
+      startClientX: pointer.clientX,
+      startClientY: pointer.clientY,
+      clientX: pointer.clientX,
+      clientY: pointer.clientY,
+      rect: {
+        left: rect.left,
+        top: rect.top,
+        width: rect.width,
+        height: rect.height,
+      },
+      origin: placement,
+    };
+    setDragging(true);
+    onBaseGestureBegin(widget, mode);
+  };
+
+  const moveBaseGesture = (event: { evt: Event }): void => {
+    const gesture = baseGestureRef.current;
+    if (!gesture) return;
+    const pointer = event.evt as MouseEvent;
+    if (!Number.isFinite(pointer.clientX) || !Number.isFinite(pointer.clientY)) return;
+    const next = {
+      ...gesture,
+      clientX: pointer.clientX,
+      clientY: pointer.clientY,
+    };
+    baseGestureRef.current = next;
+    onBaseGestureMove(next.widget, baseGesturePlacement(next));
+  };
+
+  const endBaseGesture = (): void => {
+    if (!baseGestureRef.current) return;
+    baseGestureRef.current = null;
+    setDragging(false);
+    onBaseGestureEnd();
+  };
+
   // Empty space deselects; a child hit sets cancelBubble and never lands here.
   const handleStageMouseDown = (event: { target: Konva.Node }): void => {
-    if (event.target === event.target.getStage()) onSelect(null);
+    if (event.target === event.target.getStage()) {
+      onSelect(null);
+      onSelectBase(null);
+    }
   };
 
   const handleOverlayMouseDown =
@@ -317,6 +484,13 @@ export default function SceneStage({
       onSelect(index);
     };
 
+  const handleBaseMouseDown =
+    (widget: BaseWidget) =>
+    (event: { target: Konva.Node; cancelBubble?: boolean }): void => {
+      event.cancelBubble = true;
+      onSelectBase(widget);
+    };
+
   return (
     <div
       ref={wrapperRef}
@@ -324,10 +498,16 @@ export default function SceneStage({
       data-testid="scene-stage"
       role="img"
       aria-label="Scene preview"
+      aria-describedby="scene-stage-guides-description"
       data-preview-src={previewUrl}
       data-image-status={status ?? "not-loaded"}
       data-dragging={dragging ? "true" : null}
     >
+      <p id="scene-stage-guides-description" className="sr-only">
+        Labeled dashed guides mark where the panel renders real Spotify content.
+        The editor does not have live Spotify content, so the guides do not
+        preview the current track.
+      </p>
       <Stage
         ref={(node) => {
           stageRef.current = node;
@@ -350,8 +530,78 @@ export default function SceneStage({
             />
           ) : null}
         </Layer>
-        {/* Guidance layer: derived from committed 0-1 scene values only. */}
-        <Layer>
+        {/* Base Spotify content guides: deliberately BELOW overlay guidance. */}
+        <Layer id="base-placement-guides">
+          {BASE_WIDGET_KEYS.map((widget) => {
+            const placement = basePlacements[widget];
+            const box = baseGuideBox(widget, placement);
+            const centerX = placement.x * GLASS_WIDTH;
+            const centerY = placement.y * GLASS_HEIGHT;
+            const isSelected = selectedBase === widget;
+            const resizeHandle = baseResizeHandle(widget, placement, box);
+            const centeredLabel = widget === "cover" || widget === "progress";
+            const labelWidth = centeredLabel ? 176 : box.width - 12;
+            const labelX = centeredLabel ? centerX - labelWidth / 2 : centerX - box.width / 2 + 6;
+            const labelY =
+              box.height < 24 ? centerY - 24 : centerY - box.height / 2 + 4;
+            return (
+              <Group key={`base-${widget}`}>
+                <Rect
+                  id={`base-${widget}`}
+                  x={centerX}
+                  y={centerY}
+                  offsetX={box.width / 2}
+                  offsetY={box.height / 2}
+                  width={box.width}
+                  height={box.height}
+                  cornerRadius={4}
+                  stroke={isSelected ? "#38bdf8" : "#f8fafc"}
+                  strokeWidth={isSelected ? 3 : 2}
+                  dash={[8, 6]}
+                  draggable
+                  onDragStart={(event) => startBaseGesture(widget, "move", event)}
+                  onDragMove={moveBaseGesture}
+                  onDragEnd={endBaseGesture}
+                  onMouseDown={handleBaseMouseDown(widget)}
+                />
+                <Text
+                  id={`base-label-${widget}`}
+                  x={labelX}
+                  y={labelY}
+                  width={labelWidth}
+                  text={`${BASE_WIDGET_META[widget].label} · panel content`}
+                  align={centeredLabel ? "center" : "left"}
+                  fontSize={12}
+                  fontStyle="bold"
+                  fill="#f8fafc"
+                  stroke="#020617"
+                  strokeWidth={3}
+                  listening={false}
+                />
+                {isSelected && (
+                  <Circle
+                    id={`base-resize-handle-${widget}`}
+                    x={resizeHandle.x}
+                    y={resizeHandle.y}
+                    radius={HANDLE_RADIUS}
+                    fill="#ffffff"
+                    stroke="#2563eb"
+                    strokeWidth={2}
+                    draggable
+                    onDragStart={(event) =>
+                      startBaseGesture(widget, "resize", event)
+                    }
+                    onDragMove={moveBaseGesture}
+                    onDragEnd={endBaseGesture}
+                    onMouseDown={handleBaseMouseDown(widget)}
+                  />
+                )}
+              </Group>
+            );
+          })}
+        </Layer>
+        {/* Overlay guidance layer: derived from committed 0-1 scene values only. */}
+        <Layer id="overlay-placement-guides">
           {overlays.map((overlay, index) => {
             const centerX = overlay.x * GLASS_WIDTH;
             const centerY = overlay.y * GLASS_HEIGHT;

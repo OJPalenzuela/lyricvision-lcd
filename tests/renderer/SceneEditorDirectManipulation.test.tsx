@@ -12,13 +12,20 @@ import type { ReactNode } from "react";
 import "./konvaJsdomShims";
 import { sceneStageRef } from "@/components/SceneStage";
 import SceneEditor from "@/components/SceneEditor";
+import {
+  BASE_WIDGET_KEYS,
+  type Scene,
+  type TextOverlay,
+} from "@/lib/scene";
+import {
+  PORTRAIT_HEIGHT,
+  PORTRAIT_WIDTH,
+} from "@/lib/basePlacements";
 import type { LyricvisionBridge, StoredSettings } from "@/lib/bridge";
 import {
   DEFAULT_SCENE,
   SCENE_OVERLAYS_CAP,
   type MediaBackgroundKind,
-  type Scene,
-  type TextOverlay,
 } from "@/lib/scene";
 
 // motion/react (S7-T19 panel-swap animation) mocked to a passthrough so
@@ -216,6 +223,109 @@ function clickEmptySpace(coords: Point): void {
   if (!content) throw new Error("stage content element not found");
   fireEvent.mouseDown(content, coords);
   fireEvent.mouseUp(content, coords);
+}
+
+interface LogicalRect {
+  label: string;
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+}
+
+interface LogicalPoint {
+  x: number;
+  y: number;
+}
+
+function logicalNodeRect(id: string, label: string): LogicalRect {
+  const node = konvaNode(id);
+  const centerX = Number(node.getAttr("x"));
+  const centerY = Number(node.getAttr("y"));
+  const width = Number(node.getAttr("width"));
+  const height = Number(node.getAttr("height"));
+  const rotation = Number(node.getAttr("rotation") ?? 0);
+  if (![centerX, centerY, width, height, rotation].every(Number.isFinite)) {
+    throw new Error(`${label} has non-finite geometry`);
+  }
+  const radians = (rotation * Math.PI) / 180;
+  const extentX =
+    (Math.abs(width * Math.cos(radians)) +
+      Math.abs(height * Math.sin(radians))) /
+    2;
+  const extentY =
+    (Math.abs(width * Math.sin(radians)) +
+      Math.abs(height * Math.cos(radians))) /
+    2;
+  return {
+    label,
+    left: centerX - extentX,
+    top: centerY - extentY,
+    right: centerX + extentX,
+    bottom: centerY + extentY,
+  };
+}
+
+function contains(rect: LogicalRect, point: LogicalPoint): boolean {
+  return (
+    point.x >= rect.left &&
+    point.x <= rect.right &&
+    point.y >= rect.top &&
+    point.y <= rect.bottom
+  );
+}
+
+function deriveEmptyPoint(scene: Scene): {
+  logical: LogicalPoint;
+  client: Point;
+  blocked: LogicalRect[];
+} {
+  const blocked = [
+    ...BASE_WIDGET_KEYS.map((widget) =>
+      logicalNodeRect(`base-${widget}`, `base:${widget}`)
+    ),
+    ...scene.overlays.map((_, index) =>
+      logicalNodeRect(`overlay-${index}`, `overlay:${index}`)
+    ),
+  ];
+  const xEdges = new Set<number>([0, PORTRAIT_WIDTH]);
+  const yEdges = new Set<number>([0, PORTRAIT_HEIGHT]);
+  for (const rect of blocked) {
+    if (rect.right > 0 && rect.left < PORTRAIT_WIDTH) {
+      xEdges.add(Math.max(0, rect.left));
+      xEdges.add(Math.min(PORTRAIT_WIDTH, rect.right));
+    }
+    if (rect.bottom > 0 && rect.top < PORTRAIT_HEIGHT) {
+      yEdges.add(Math.max(0, rect.top));
+      yEdges.add(Math.min(PORTRAIT_HEIGHT, rect.bottom));
+    }
+  }
+  const xs = [...xEdges].sort((a, b) => a - b);
+  const ys = [...yEdges].sort((a, b) => a - b);
+  let best: { point: LogicalPoint; area: number } | undefined;
+  for (let xi = 0; xi + 1 < xs.length; xi += 1) {
+    for (let yi = 0; yi + 1 < ys.length; yi += 1) {
+      const point = {
+        x: (xs[xi] + xs[xi + 1]) / 2,
+        y: (ys[yi] + ys[yi + 1]) / 2,
+      };
+      if (blocked.some((rect) => contains(rect, point))) continue;
+      const area = (xs[xi + 1] - xs[xi]) * (ys[yi + 1] - ys[yi]);
+      if (!best || area > best.area) best = { point, area };
+    }
+  }
+  if (!best) {
+    throw new Error("scene has no empty logical point inside the stage");
+  }
+  const scale = STAGE_RECT.width / PORTRAIT_WIDTH;
+  return {
+    logical: best.point,
+    client: {
+      clientX: STAGE_RECT.left + best.point.x * scale,
+      clientY: STAGE_RECT.top + best.point.y * scale,
+    },
+    blocked,
+  };
 }
 
 describe("S7-T21 Konva drag to move", () => {
@@ -453,9 +563,11 @@ describe("S7-T21 gesture contract (live node values, single debounced preview)",
 
 describe("S7-T21 selection", () => {
   it("keeps stage selection, list selection and the inspector in sync; empty click deselects; keyboard works without a pointer", async () => {
-    const { user } = setup(
-      sceneWithOverlays([textOverlay("One"), textOverlay("Two", { x: 0.25 })])
-    );
+    const sceneUnderTest = sceneWithOverlays([
+      textOverlay("One"),
+      textOverlay("Two", { x: 0.25 }),
+    ]);
+    const { user } = setup(sceneUnderTest);
     await previewReady();
     stubStageRect();
 
@@ -506,8 +618,26 @@ describe("S7-T21 selection", () => {
     goSection("Propiedades");
     expect(screen.getByLabelText("Overlay X (0-1)")).toHaveValue("0.25");
 
-    // Empty-space click deselects: inspector goes away, no row stays pressed.
-    clickEmptySpace({ clientX: 120, clientY: 70 });
+    // Empty-space click deselects. Derive the point from the mounted scene
+    // instead of guessing a client literal: base and overlay hit boxes can
+    // change with the scene, and the point must still be inside the canvas.
+    const derived = deriveEmptyPoint(sceneUnderTest);
+    expect(derived.logical.x).toBeGreaterThan(0);
+    expect(derived.logical.x).toBeLessThan(PORTRAIT_WIDTH);
+    expect(derived.logical.y).toBeGreaterThan(0);
+    expect(derived.logical.y).toBeLessThan(PORTRAIT_HEIGHT);
+    expect(
+      derived.blocked.filter((rect) => contains(rect, derived.logical))
+    ).toEqual([]);
+    expect(derived.client.clientX).toBeGreaterThan(STAGE_RECT.left);
+    expect(derived.client.clientX).toBeLessThan(
+      STAGE_RECT.left + STAGE_RECT.width
+    );
+    expect(derived.client.clientY).toBeGreaterThan(STAGE_RECT.top);
+    expect(derived.client.clientY).toBeLessThan(
+      STAGE_RECT.top + STAGE_RECT.height
+    );
+    clickEmptySpace(derived.client);
     expect(screen.queryByLabelText("Overlay text")).not.toBeInTheDocument();
     expect(
       screen.queryByLabelText("Overlay rotation (degrees)")

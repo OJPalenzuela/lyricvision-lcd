@@ -62,6 +62,7 @@ export default function App() {
   // Editor-only UI state (selection, section, drafts) stays in SceneEditor.
   const scene = useSceneStore((s) => s.scene);
   const setScene = useSceneStore((s) => s.setScene);
+  const setBasePlacement = useSceneStore((s) => s.setBasePlacement);
   const hydrateScene = useSceneStore((s) => s.hydrate);
   const markSceneSaved = useSceneStore((s) => s.markSaved);
   const resetScene = useSceneStore((s) => s.resetToSaved);
@@ -480,6 +481,7 @@ export default function App() {
             <SceneEditor
               scene={scene}
               onSceneChange={setScene}
+              onBasePlacementChange={setBasePlacement}
               onReset={resetScene}
               onSaved={markSceneSaved}
             />

@@ -18,11 +18,20 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { ColorPicker } from "@/components/ui/color-picker";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Separator } from "@/components/ui/separator";
+import {
+  BASE_WIDGET_META,
+  resolveBasePlacements,
+  sameBasePlacement,
+} from "@/lib/basePlacements";
 import { errMessage, type LyricvisionBridge } from "@/lib/bridge";
 import {
+  BASE_WIDGET_KEYS,
   SCENE_MAX_TEXT_CHARS,
   SCENE_OVERLAYS_CAP,
   type Background,
+  type BasePlacement,
+  type BaseWidget,
   type MediaBackgroundKind,
   type Scene,
 } from "@/lib/scene";
@@ -101,6 +110,7 @@ function normalizeHexColor(raw: string): string | null {
 type CoalesceOwner = "drag" | "field" | "color";
 
 type UnitField = "x" | "y" | "size" | "rotation";
+type BaseUnitField = "x" | "y" | "size";
 type TransformField = "rotation" | "scale" | "panX" | "panY";
 
 const EMPTY_UNIT_DRAFTS: Record<UnitField, string> = {
@@ -108,6 +118,12 @@ const EMPTY_UNIT_DRAFTS: Record<UnitField, string> = {
   y: "0.5",
   size: "0.1",
   rotation: "0",
+};
+
+const EMPTY_BASE_UNIT_DRAFTS: Record<BaseUnitField, string> = {
+  x: "0.5",
+  y: "0.5",
+  size: "0.1",
 };
 
 const INITIAL_TRANSFORM: Record<TransformField, string> = {
@@ -136,6 +152,13 @@ const UNIT_RANGES: Record<UnitField, readonly [number, number]> = {
   size: [0, 1],
   rotation: [-360, 360],
 };
+
+function baseFieldLabel(widget: BaseWidget, field: BaseUnitField): string {
+  const { label, sizeUnit } = BASE_WIDGET_META[widget];
+  if (field === "size") return `${label} size (0-1 ${sizeUnit})`;
+  const axis = field === "x" ? "width" : "height";
+  return `${label} ${field.toUpperCase()} (0-1 ${axis})`;
+}
 
 /**
  * Draft-record pattern: unparseable input ("" or a trailing ".") stays a
@@ -402,6 +425,8 @@ function validationMessage(
 interface SceneEditorProps {
   scene: Scene;
   onSceneChange: (scene: Scene) => void;
+  /** Production wires the identity-guarded store action; tests may use the props facade. */
+  onBasePlacementChange?: (widget: BaseWidget, placement: BasePlacement) => void;
   onReset: () => void;
   /** Called after a successful save so App can refresh its reset baseline. */
   onSaved?: (scene: Scene) => void;
@@ -410,11 +435,13 @@ interface SceneEditorProps {
 export default function SceneEditor({
   scene,
   onSceneChange,
+  onBasePlacementChange,
   onReset,
   onSaved,
 }: SceneEditorProps) {
   // Ephemeral editor-local state (see file header).
   const [selected, setSelected] = useState<number | null>(0);
+  const [selectedBase, setSelectedBase] = useState<BaseWidget | null>(null);
   // Active rail section (S7-T19): persistent nav, no edit-mode toggle.
   const [section, setSection] = useState<SceneSectionId>("fondo");
   // S7-T21 gesture coalescing (see file header): history is paused for the
@@ -523,6 +550,9 @@ export default function SceneEditor({
   const [unitDrafts, setUnitDrafts] = useState<Record<UnitField, string>>(
     EMPTY_UNIT_DRAFTS
   );
+  const [baseUnitDrafts, setBaseUnitDrafts] = useState<
+    Record<BaseUnitField, string>
+  >(EMPTY_BASE_UNIT_DRAFTS);
   const [transform, setTransform] =
     useState<Record<TransformField, string>>(INITIAL_TRANSFORM);
   const [flipH, setFlipH] = useState(false);
@@ -547,14 +577,30 @@ export default function SceneEditor({
   const previewTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const overlays = scene.overlays;
+  const basePlacements = useMemo(
+    () => resolveBasePlacements(scene.basePlacements),
+    [scene.basePlacements]
+  );
   const safeIndex =
     selected === null ? -1 : Math.min(selected, Math.max(0, overlays.length - 1));
-  const selectedOverlay = safeIndex >= 0 ? (overlays[safeIndex] ?? null) : null;
+  const selectedBasePlacement = selectedBase ? basePlacements[selectedBase] : null;
+  const selectedOverlay =
+    selectedBase === null && safeIndex >= 0 ? (overlays[safeIndex] ?? null) : null;
   const backgroundKind = scene.background.kind;
   const backgroundColor =
     scene.background.kind === "color" ? scene.background.color : COLOR_FALLBACK;
   const mediaBackground = isMediaKind(scene.background) ? scene.background : null;
   const atCap = overlays.length >= SCENE_OVERLAYS_CAP;
+
+  const selectOverlay = (index: number | null): void => {
+    setSelectedBase(null);
+    setSelected(index);
+  };
+
+  const selectBaseWidget = (widget: BaseWidget | null): void => {
+    setSelected(null);
+    setSelectedBase(widget);
+  };
 
   // Observe the current/hydrated scene for feedback only. App/store hydration
   // remains untouched; the authoritative save and USB gates stay in main/Python.
@@ -585,6 +631,12 @@ export default function SceneEditor({
             rotation: String(overlay.rotation),
           }
         : EMPTY_UNIT_DRAFTS
+    );
+    const base = selectedBase ? basePlacements[selectedBase] : null;
+    setBaseUnitDrafts(
+      base
+        ? { x: String(base.x), y: String(base.y), size: String(base.size) }
+        : EMPTY_BASE_UNIT_DRAFTS
     );
     const background = scene.background;
     if (!isMediaKind(background)) return;
@@ -635,6 +687,19 @@ export default function SceneEditor({
         : EMPTY_UNIT_DRAFTS
     );
   }, [scene, safeIndex]);
+
+  useEffect(() => {
+    const placement = selectedBase ? basePlacements[selectedBase] : null;
+    setBaseUnitDrafts(
+      placement
+        ? {
+            x: String(placement.x),
+            y: String(placement.y),
+            size: String(placement.size),
+          }
+        : EMPTY_BASE_UNIT_DRAFTS
+    );
+  }, [basePlacements, selectedBase]);
 
   // Media backgrounds own the transform values: mirror them back into the
   // drafts whenever scene state changes (Reset, external load, own commits),
@@ -705,6 +770,10 @@ export default function SceneEditor({
       return next;
     });
 
+  const setBaseUnitDraft = (field: BaseUnitField, value: string): void => {
+    setBaseUnitDrafts((previous) => ({ ...previous, [field]: value }));
+  };
+
   const setTransformDraft = (field: TransformField, value: string) =>
     setTransform((prev) => {
       const next: Record<TransformField, string> = {
@@ -720,6 +789,35 @@ export default function SceneEditor({
   const commitOverlays = (next: Scene["overlays"]) =>
     commitScene({ ...scene, overlays: next });
 
+  const commitBasePlacement = (
+    widget: BaseWidget,
+    placement: BasePlacement
+  ): boolean => {
+    if (sameBasePlacement(scene.basePlacements?.[widget], placement)) return true;
+    const next: Scene = {
+      ...scene,
+      basePlacements: {
+        ...scene.basePlacements,
+        [widget]: { ...placement },
+      },
+    };
+    const validation = validateSceneForModel(next);
+    if (!validation.success) {
+      setDraftValidationIssues(validation.issues);
+      restoreRejectedDrafts();
+      setSavedNote(null);
+      return false;
+    }
+    setDraftValidationIssues([]);
+    if (onBasePlacementChange) {
+      onBasePlacementChange(widget, { ...placement });
+      setSavedNote(null);
+    } else if (!commitScene(next)) {
+      return false;
+    }
+    return true;
+  };
+
   /**
    * S7-T21 gesture bridge to the Konva stage (SceneStage.tsx owns
    * hit-testing and the px->unit math). This component owns what a gesture
@@ -731,7 +829,7 @@ export default function SceneEditor({
    */
   const handleGestureBegin = (index: number): void => {
     if (!scene.overlays[index]) return;
-    setSelected(index);
+    selectOverlay(index);
     gestureActive.current = true; // suppress previews until the release
     beginCoalesce("drag", scene);
     setSavedNote(null);
@@ -752,9 +850,12 @@ export default function SceneEditor({
     setSavedNote(null);
   };
 
-  const handleGestureEnd = (): void => {
+  const finishCoalescedGesture = (): void => {
+    const active = coalescing.current;
+    const changed = active !== null && active.snapshot !== scene;
     gestureActive.current = false; // unblock previews BEFORE the final commit
     endCoalesce("drag");
+    if (!changed) return;
     // Release preview, GUARANTEED: endCoalesce rewinds and re-sets the scene,
     // which can net back to an identity React bails out on (Object.is), so the
     // [scene] effect may never re-run — schedule explicitly here. Still the
@@ -762,6 +863,24 @@ export default function SceneEditor({
     // because the gate above was open only after the last commit.
     schedulePreview(scene);
   };
+
+  const handleGestureEnd = finishCoalescedGesture;
+
+  const handleBaseGestureBegin = (widget: BaseWidget): void => {
+    selectBaseWidget(widget);
+    gestureActive.current = true;
+    beginCoalesce("drag", scene);
+    setSavedNote(null);
+  };
+
+  const handleBaseGestureMove = (
+    widget: BaseWidget,
+    placement: BasePlacement
+  ): void => {
+    commitBasePlacement(widget, placement);
+  };
+
+  const handleBaseGestureEnd = finishCoalescedGesture;
 
   /**
    * S7-T22 dnd-kit commit (Capas): the DROP mutates the array through the
@@ -800,7 +919,7 @@ export default function SceneEditor({
     if (!anchor) return;
     const next = useSceneStore.getState().scene.overlays;
     const newIndex = next.indexOf(anchor);
-    if (newIndex >= 0 && newIndex !== safeIndex) setSelected(newIndex);
+    if (newIndex >= 0 && newIndex !== safeIndex) selectOverlay(newIndex);
   };
 
   /**
@@ -846,6 +965,21 @@ export default function SceneEditor({
     });
     commitOverlays(overlaysNext);
     setSavedNote(null);
+  };
+
+  const handleBaseUnit = (
+    field: BaseUnitField,
+    raw: string
+  ): void => {
+    const [min, max] = UNIT_RANGES[field];
+    const result = stagedNumber(raw, min, max);
+    setBaseUnitDraft(field, result ? result.draft : raw);
+    if (!result || !selectedBase || !selectedBasePlacement) return;
+    commitBasePlacement(selectedBase, {
+      x: field === "x" ? result.commit : selectedBasePlacement.x,
+      y: field === "y" ? result.commit : selectedBasePlacement.y,
+      size: field === "size" ? result.commit : selectedBasePlacement.size,
+    });
   };
 
   const handleTransform = (field: TransformField, raw: string) => {
@@ -991,7 +1125,7 @@ export default function SceneEditor({
     };
     const next = [...overlays, overlay];
     commitOverlays(next);
-    setSelected(next.length - 1); // a new overlay auto-selects
+    selectOverlay(next.length - 1); // a new overlay auto-selects
     setSavedNote(null);
   };
 
@@ -1001,7 +1135,7 @@ export default function SceneEditor({
     if (safeIndex < 0 || !overlays.length) return;
     const next = overlays.filter((_, i) => i !== safeIndex);
     commitOverlays(next);
-    setSelected(Math.max(0, Math.min(safeIndex, next.length - 1)));
+    selectOverlay(Math.max(0, Math.min(safeIndex, next.length - 1)));
     setSavedNote(null);
   };
 
@@ -1278,13 +1412,46 @@ export default function SceneEditor({
   // row order IS scene.overlays order = the sidecar paint order (z-order).
   const capasPanel = (
     <>
+      <div className="flex flex-col gap-2 rounded-md border p-3">
+        <div>
+          <p className="text-sm font-medium">Spotify content</p>
+          <p className="text-xs text-muted-foreground">
+            These placement guides are painted below your scene overlays. Select
+            one to edit it; this group is not sortable with overlay rows.
+          </p>
+        </div>
+        <ul
+          aria-label="Spotify content placement guides"
+          className="flex flex-col gap-1"
+        >
+          {BASE_WIDGET_KEYS.map((widget) => {
+            const meta = BASE_WIDGET_META[widget];
+            return (
+              <li key={`base-row-${widget}`}>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={selectedBase === widget ? "default" : "outline"}
+                  className="w-full justify-start"
+                  aria-pressed={selectedBase === widget}
+                  aria-label={`Select ${meta.label} placement guide. The panel renders the real Spotify ${meta.panelContent} here; the editor does not have live Spotify content.`}
+                  onClick={() => selectBaseWidget(widget)}
+                >
+                  {meta.label}
+                </Button>
+              </li>
+            );
+          })}
+        </ul>
+      </div>
+      <Separator />
       {/* Text overlays: rows select; the selected one is edited in the
           Propiedades section. */}
       <div className="space-y-2">
         <LayersList
           overlays={overlays}
           selected={safeIndex}
-          onSelect={setSelected}
+          onSelect={selectOverlay}
           onReorder={handleReorder}
         />
         <div className="flex gap-2">
@@ -1317,9 +1484,9 @@ export default function SceneEditor({
     <>
       <div className="space-y-2">
         <p className="text-sm font-medium">Propiedades</p>
-        {!selectedOverlay && (
+        {!selectedOverlay && !selectedBasePlacement && (
           <p className="text-xs text-muted-foreground">
-            Select an overlay on the preview or in Capas to edit its
+            Select a Spotify content guide or scene overlay in Capas to edit its
             properties.
           </p>
         )}
@@ -1469,6 +1636,44 @@ export default function SceneEditor({
             </div>
           </motion.div>
         )}
+
+        {selectedBase && selectedBasePlacement && (
+          <motion.div
+            key={`base-card-${selectedBase}`}
+            initial={{ opacity: 0, y: 4 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.15 }}
+            className="grid grid-cols-2 gap-3 rounded-md border p-3"
+          >
+            <div className="col-span-2 flex flex-col gap-1">
+              <p className="text-sm font-medium">
+                {BASE_WIDGET_META[selectedBase].label}
+              </p>
+              <p className="text-xs text-muted-foreground">
+                {BASE_WIDGET_META[selectedBase].description} The panel renders
+                the real content at this guide; the editor has no live Spotify
+                content.
+              </p>
+            </div>
+            {(["x", "y", "size"] as const).map((field) => {
+              const id = `base-${selectedBase}-${field}`;
+              const path = `basePlacements.${selectedBase}.${field}`;
+              return (
+                <div key={field} className="flex flex-col gap-1">
+                  <Label htmlFor={id}>{baseFieldLabel(selectedBase, field)}</Label>
+                  <Input
+                    id={id}
+                    inputMode="decimal"
+                    value={baseUnitDrafts[field]}
+                    onChange={(event) => handleBaseUnit(field, event.target.value)}
+                    {...validationProps(id, validationIssues, [path])}
+                  />
+                  {validationMessage(id, validationIssues, [path])}
+                </div>
+              );
+            })}
+          </motion.div>
+        )}
       </div>
     </>
   );
@@ -1490,11 +1695,17 @@ export default function SceneEditor({
             <SceneStage
               previewUrl={previewUrl}
               overlays={overlays}
-              selected={safeIndex >= 0 ? safeIndex : null}
-              onSelect={setSelected}
+              basePlacements={basePlacements}
+              selected={selectedBase === null && safeIndex >= 0 ? safeIndex : null}
+              selectedBase={selectedBase}
+              onSelect={selectOverlay}
+              onSelectBase={selectBaseWidget}
               onGestureBegin={handleGestureBegin}
               onGestureMove={handleGestureMove}
               onGestureEnd={handleGestureEnd}
+              onBaseGestureBegin={handleBaseGestureBegin}
+              onBaseGestureMove={handleBaseGestureMove}
+              onBaseGestureEnd={handleBaseGestureEnd}
             />
           ) : (
             <p className="text-xs text-muted-foreground">Waiting for the panel…</p>

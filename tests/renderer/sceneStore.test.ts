@@ -40,6 +40,10 @@ function colorScene(color: string): Scene {
   return { ...DEFAULT_SCENE, background: { kind: "color", color } };
 }
 
+function basePlacement(x: number, y: number, size: number) {
+  return { x, y, size };
+}
+
 beforeEach(() => {
   // Boot-equivalent reset: every test starts from the default scene with
   // an empty history, no matter what the previous test left behind.
@@ -48,7 +52,7 @@ beforeEach(() => {
 
 describe("scene store actions (state shape pinned)", () => {
   it("exposes exactly the scene data and the action surface", () => {
-    expect(Object.keys(state()).sort()).toEqual(["addOverlay", "hydrate", "markSaved", "redo", "removeOverlay", "reorderOverlays", "resetToSaved", "savedScene", "scene", "setBackground", "setScene", "undo", "updateOverlay"]);
+    expect(Object.keys(state()).sort()).toEqual(["addOverlay", "hydrate", "markSaved", "redo", "removeOverlay", "reorderOverlays", "resetToSaved", "savedScene", "scene", "setBackground", "setBasePlacement", "setScene", "undo", "updateOverlay"]);
   });
 
   it("setScene replaces the whole scene and records one history entry", () => {
@@ -88,6 +92,57 @@ describe("scene store actions (state shape pinned)", () => {
     const snapshot = state().scene;
     state().updateOverlay(9, { x: 0.1 });
     expect(state().scene).toBe(snapshot);
+  });
+
+  it("[S1] setBasePlacement is identity-guarded, structurally shares siblings, and survives overlay reorder", () => {
+    const cover = basePlacement(0.5, 0.2, 0.4);
+    const title = basePlacement(0.5, 0.4, 0.05);
+    const before: Scene = {
+      ...DEFAULT_SCENE,
+      overlays: [textOverlay("A"), textOverlay("B")],
+      basePlacements: { cover, title },
+    };
+    state().hydrate(before);
+
+    state().setBasePlacement("cover", { ...cover });
+    expect(state().scene).toBe(before);
+    expect(state().scene.basePlacements).toBe(before.basePlacements);
+    expect(history().pastStates).toHaveLength(0);
+
+    const lyrics = basePlacement(0.2, 0.8, 0.06);
+    state().setBasePlacement("lyrics", lyrics);
+    expect(state().scene.basePlacements).toEqual({ cover, title, lyrics });
+    expect(state().scene.basePlacements?.cover).toBe(cover);
+    expect(state().scene.basePlacements?.title).toBe(title);
+    expect(state().scene.overlays).toBe(before.overlays);
+    expect(isScene(state().scene)).toBe(true);
+    expect(history().pastStates).toHaveLength(1);
+
+    const placements = state().scene.basePlacements;
+    state().reorderOverlays(1, 0);
+    expect(state().scene.basePlacements).toBe(placements);
+    expect(state().scene.basePlacements).toEqual({ cover, title, lyrics });
+    expect(history().pastStates).toHaveLength(2);
+  });
+
+  it("[S1b] setBasePlacement rebuilds the scene and placement map but preserves background identity", () => {
+    const background = { kind: "color", color: "#123456" } as const;
+    const before: Scene = {
+      ...DEFAULT_SCENE,
+      background,
+      basePlacements: { cover: basePlacement(0.5, 0.2, 0.4) },
+    };
+    state().hydrate(before);
+
+    state().setBasePlacement("cover", basePlacement(0.6, 0.3, 0.5));
+
+    expect(state().scene).not.toBe(before);
+    expect(state().scene.background).toBe(background);
+    expect(state().scene.basePlacements).not.toBe(before.basePlacements);
+    expect(state().scene.basePlacements?.cover).toEqual(
+      basePlacement(0.6, 0.3, 0.5)
+    );
+    expect(history().pastStates).toHaveLength(1);
   });
 
   it("addOverlay appends the default text overlay and enforces the cap", () => {

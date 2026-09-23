@@ -36,6 +36,8 @@ import {
   DEFAULT_SCENE,
   SCENE_OVERLAYS_CAP,
   type Background,
+  type BasePlacement,
+  type BaseWidget,
   type Overlay,
   type OverlayPlacement,
   type Scene,
@@ -57,6 +59,8 @@ interface SceneStoreState {
   setScene(next: Scene): void;
   /** Patch one overlay's shared placement (x/y/size/rotation/color). */
   updateOverlay(index: number, patch: Partial<OverlayPlacement>): void;
+  /** Set one complete base-widget placement; equal values are an identity no-op. */
+  setBasePlacement(widget: BaseWidget, placement: BasePlacement): void;
   /** Move the overlay at `from` to index `to` (exactly one history entry). */
   reorderOverlays(from: number, to: number): void;
   /** Append an overlay (defaults to the standard new text overlay). */
@@ -119,6 +123,28 @@ export const useSceneStore = create<SceneStoreState>()(
               overlays: state.scene.overlays.map((overlay, i) =>
                 i === index ? { ...overlay, ...patch } : overlay
               ),
+            },
+          };
+        }),
+
+      setBasePlacement: (widget, placement) =>
+        set((state) => {
+          const existing = state.scene.basePlacements?.[widget];
+          if (
+            existing !== undefined &&
+            existing.x === placement.x &&
+            existing.y === placement.y &&
+            existing.size === placement.size
+          ) {
+            return {};
+          }
+          return {
+            scene: {
+              ...state.scene,
+              basePlacements: {
+                ...state.scene.basePlacements,
+                [widget]: placement,
+              },
             },
           };
         }),

@@ -71,7 +71,8 @@ const LAYOUT_VALUES = new Set(['lyrics', 'cover']);
 
 // settings.json whitelist: key -> expected type ('fps' = clamped number,
 // 'syncOffset' = finite number inside [SYNC_OFFSET_MIN_MS, SYNC_OFFSET_MAX_MS],
-// 'layout' = exact 'lyrics'|'cover', anything else rejected).
+// 'layout' = exact 'lyrics'|'cover', 'scene' = whole object via
+// hardening.validateScene (accepted or rejected as one unit), else rejected).
 // Token keys are NEVER accepted here, even if sent (main writes tokens only).
 const SETTINGS_SCHEMA = {
   spotifyClientId: 'string',
@@ -80,6 +81,7 @@ const SETTINGS_SCHEMA = {
   layout: 'layout',
   serial: 'string',
   runAtStartup: 'boolean',
+  scene: 'scene',
 };
 const TOKEN_KEYS = new Set(['accessToken', 'refreshToken', 'expiresAt', 'token']);
 
@@ -198,7 +200,9 @@ function lyricsCachePath() {
 }
 
 function loadSettings() {
-  const defaults = { spotifyClientId: '', lcdFps: DEFAULT_FPS, syncOffsetMs: DEFAULT_SYNC_OFFSET_MS, layout: DEFAULT_LAYOUT, serial: '', runAtStartup: false };
+  // scene is deep-cloned per call so a caller mutating settings.scene can
+  // never corrupt the shared hardening.DEFAULT_SCENE constant.
+  const defaults = { spotifyClientId: '', lcdFps: DEFAULT_FPS, syncOffsetMs: DEFAULT_SYNC_OFFSET_MS, layout: DEFAULT_LAYOUT, serial: '', runAtStartup: false, scene: structuredClone(hardening.DEFAULT_SCENE) };
   let raw = {};
   try {
     raw = JSON.parse(fs.readFileSync(settingsPath(), 'utf8'));
@@ -216,6 +220,11 @@ function loadSettings() {
       out[key] = clampSyncOffset(value);
     } else if (kind === 'layout') {
       out[key] = normalizeLayout(value);
+    } else if (kind === 'scene') {
+      // Absent/invalid file value keeps the fresh default already in `out` —
+      // a scene is accepted whole or not at all (never a partial object).
+      const result = hardening.validateScene(value);
+      if (result.ok) out[key] = result.scene;
     }
     // wrong types fall back to defaults (validated, never throw on user files)
   }
@@ -259,6 +268,11 @@ function validateSettingsPatch(patch) {
       }
     } else if (kind === 'layout') {
       if (typeof value === 'string' && LAYOUT_VALUES.has(value)) accepted[key] = value;
+      else rejected.push(key);
+    } else if (kind === 'scene') {
+      // Whole-object gate: one bad field rejects the entire key (no partial scenes).
+      const result = hardening.validateScene(value);
+      if (result.ok) accepted[key] = result.scene;
       else rejected.push(key);
     } else {
       rejected.push(key);
@@ -902,6 +916,12 @@ function buildBridgeState(player, settings) {
   const safe = player && typeof player === 'object' ? player : {};
   const cfg = settings && typeof settings === 'object' ? settings : {};
   const layout = normalizeLayout(cfg.layout);
+  // Scene (S1-T7a): the sidecar's composed frame reads
+  // state.settings.scene, so this is the last mile. Re-validated here even
+  // though loadSettings already gated it: buildBridgeState also runs on raw
+  // objects, and an invalid scene must be OMITTED (never sent, never a
+  // partial) so the sidecar's fail-safe falls back to the lyrics view.
+  const sceneGate = hardening.validateScene(cfg.scene);
   const rawTrack =
     safe.track && typeof safe.track === 'object' ? safe.track : { title: 'Unknown Track', artist: '' };
   const track = { ...rawTrack };
@@ -921,7 +941,13 @@ function buildBridgeState(player, settings) {
     durationMs: safe.durationMs || 0,
     isPlaying: safe.isPlaying === true,
     layout,
-    settings: { lcdFps: clampFps(cfg.lcdFps), layout },
+    settings: {
+      lcdFps: clampFps(cfg.lcdFps),
+      layout,
+      // Undefined keys vanish in JSON.stringify, so the wire envelope
+      // carries `scene` only when this gate accepted it.
+      ...(sceneGate.ok ? { scene: sceneGate.scene } : {}),
+    },
   };
 }
 
@@ -1381,7 +1407,16 @@ function registerIpc() {
         // exit handler restarts it
       }
     }
-    if (accepted.lcdFps !== undefined || accepted.syncOffsetMs !== undefined || accepted.layout !== undefined) sendStateToBridge();
+    if (
+      accepted.lcdFps !== undefined ||
+      accepted.syncOffsetMs !== undefined ||
+      accepted.layout !== undefined ||
+      // Scene edits (S1-T7a) must reach the sidecar without waiting for
+      // the next poll tick.
+      accepted.scene !== undefined
+    ) {
+      sendStateToBridge();
+    }
     return { settings: next, rejected };
   });
 

@@ -13,3 +13,7 @@ __pycache__/
 *.key
 coverage/
 odd/
+# User-imported scene media (images/GIFs the shell copies in for the
+# media-root gate in bridge/lcd_bridge.py). Private user assets must
+# never enter the repository or a release diff.
+media/

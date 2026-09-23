@@ -266,16 +266,25 @@ def test_static_scene_progress_advance_dirties():
 
 
 def test_progress_clock_ticks_dirty_the_key_without_state_change():
-    # Same state object, same scene: only the wall clock advances. The
-    # extrapolated m:ss clock changes every second while playing, so the
-    # time bucket must catch it with zero state change.
+    # Same state object, same scene: only the wall clock advances. While
+    # playing the extrapolated m:ss clock AND the pixel-quantized bar keep
+    # moving with ZERO state change, so the time bucket must dirty the key
+    # at REFRESH_PLAYING_MS granularity. It used to be second-wide
+    # ("one bucket == one displayed second", t0+400 == k0), which caught
+    # only the m:ss text and under-repainted the sub-second bar.
     scene = color_scene("#123456")
     state = unified_state()
-    t0 = MEASURED_AT + 50_000.0
+    bucket_ms = lcd_bridge.REFRESH_PLAYING_MS
+    t0 = MEASURED_AT + 50_000.0          # progress 90_000 -> on a boundary
+    assert lcd_bridge.current_progress(state, t0) % bucket_ms == 0
     k0 = lcd_bridge.composite_frame_key(state, scene, now_ms=t0)
-    k_same_second = lcd_bridge.composite_frame_key(state, scene, now_ms=t0 + 400)
+    k_inside = lcd_bridge.composite_frame_key(state, scene,
+                                              now_ms=t0 + bucket_ms - 1)
+    k_next_bucket = lcd_bridge.composite_frame_key(state, scene,
+                                                   now_ms=t0 + bucket_ms)
     k_next_second = lcd_bridge.composite_frame_key(state, scene, now_ms=t0 + 1000)
-    assert k_same_second == k0, "one bucket == one displayed second"
+    assert k_inside == k0, "inside one bucket nothing has moved yet"
+    assert k_next_bucket != k0, "one playing-refresh bucket must dirty the key"
     assert k_next_second != k0, "a new displayed second must dirty the key"
 
 

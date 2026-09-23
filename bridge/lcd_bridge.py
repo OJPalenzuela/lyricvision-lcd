@@ -12,7 +12,9 @@ exclusively: this bridge only REPORTS that condition (exit 3, status
 
 Stdout is machine-readable JSONL only:
   {"type": "status", ...}  ~1 Hz (panel, pm/sub, fps, queue)
-  {"type": "ack", "seq": N}  once per rendered frame that used a seq
+  {"type": "ack", "seq": N}  once per painted frame that used a seq, plus
+                             once for a drained seq whose frame was skipped
+                             as unchanged (S1-T7b)
 Human logs go to stderr. Exit codes: 0 ok, 2 unknown panel, 3 busy/absent.
 """
 
@@ -1111,15 +1113,14 @@ def render_portrait(
     if scene is None:
         return render_unified(state, glass, now_ms)
     try:
-        # S1-T7a-1 (verified defect): the live loop passes NO frame_index,
-        # so relying on render_scene's default would pin every GIF to
-        # frame 0 forever on the panel while the preview animated. The
-        # loop still wakes on the blind time.sleep(1.0 / fps) cadence (the
-        # refresh-policy wake-up is deferred with the wake-on-state piece),
-        # so the animation advances at lcdFps GRANULARITY -- ~100 ms per
-        # tick at the default 10 fps -- NOT at the GIF's own per-frame
-        # delays. That is expected and correct here: we do not control
-        # when the loop wakes yet, only WHICH frame a wake shows.
+        # S1-T7a-1 (verified defect): relying on render_scene's default
+        # would pin every GIF to frame 0 forever on the panel while the
+        # preview animated. Since S1-T7b the loop passes now_ms AND the
+        # frame_index its dirty key was computed with (same instant, same
+        # selector -- key and pixels must describe ONE frame), and it
+        # wakes on frame_refresh_ms (a GIF frame's own delay, floored at
+        # 1/lcdFps), so animation advances at the policy cadence: never
+        # pinned, never faster than lcdFps allows.
         resolved_frame = (
             frame_index
             if frame_index is not None
@@ -1194,10 +1195,10 @@ SCENE_MAX_GIF_DIM = 4096
 # COMPOSITE BEHAVIOR (S1-T7a): this sentinel is only the SCENE component.
 # frame_refresh_ms composes it with REFRESH_PLAYING_MS by MINIMUM, and
 # composite_frame_key composes scene_digest with the display-state digest,
-# frame_index and the displayed-second time bucket -- so live lyrics and
-# the extrapolated progress clock can never be frozen by a static scene
-# (proven in tests/test_compose_frame.py, the S1-T5 verifier's binding
-# acceptance criterion).
+# frame_index and a time bucket whose width IS REFRESH_PLAYING_MS -- so
+# live lyrics and the extrapolated progress clock can never be frozen by
+# a static scene (proven in tests/test_compose_frame.py, the S1-T5
+# verifier's binding acceptance criterion).
 REFRESH_STATIC_MS = 60 * 60 * 1000
 # gpu-temp overlay: sensor values move about once a second.
 REFRESH_SENSOR_MS = 1000
@@ -1208,11 +1209,15 @@ REFRESH_VIDEO_MS = 33
 # While PLAYING, the extrapolated m:ss clock changes every second and the
 # progress bar keeps moving with NO state change, so the scene's own
 # verdict (possibly the 1-hour sentinel) must be bounded: 250 ms = 4 checks
-# per displayed second, so the composite key's bucket change (it IS the
-# displayed seconds field) is observed within 250 ms of occurring. The bar
-# advances one pixel per (duration/424) ms, so every single bar-pixel
-# transition is observed for tracks >= 106 s; shorter tracks may merge a
-# couple of pixels into one 250 ms step -- a visible jump, never a freeze.
+# per displayed second, so the composite key's time bucket -- derived from
+# THIS constant, so key granularity and refresh policy cannot drift --
+# changes within 250 ms of occurring. The bar advances one pixel per
+# (duration/424) ms, so every single bar-pixel transition is observed for
+# tracks >= 106 s; shorter tracks may merge a couple of pixels into one
+# 250 ms step -- a visible jump, never a freeze. A second-wide bucket
+# (1000 ms) matched only the m:ss text and under-repainted the sub-second
+# bar; while PAUSED current_progress freezes, so this cadence and the
+# bucket both go quiet and static scenes still never repaint.
 REFRESH_PLAYING_MS = 250
 
 
@@ -2099,24 +2104,31 @@ def composite_frame_key(state, scene, *, now_ms=None, frame_index=0) -> str:
         NO_SCENE_DIGEST so the "no scene" case still composes fully.
       * state: display_state_digest -- every display-relevant value.
       * frame_index: separates GIF frames the scene digest cannot see.
-      * TIME BUCKET = floor(extrapolated_progress_ms / 1000) -- literally
-        the SECONDS FIELD format_time() renders. The key therefore changes
-        if and only when the displayed clock can change: any two
-        samples on opposite sides of a bucket boundary differ (a tick is
-        observed), and two samples inside one bucket show the same
-        displayed second (no tick happened in between). It cannot miss a
-        second by construction. The bucket rides the RENDERED value, not
-        wall time: an epoch-aligned bucket would misalign with a clock
-        whose extrapolation starts at measuredAt (+ offsetMs). While
-        paused the extrapolation is frozen, so the bucket is frozen too --
-        a stopped clock dirties nothing and the static sentinel stands.
+      * TIME BUCKET = floor(extrapolated_progress_ms / REFRESH_PLAYING_MS)
+        -- the bucket exists so the extrapolated clock and bar can dirty
+        the key with NO state change, so its width IS the paint cadence
+        while playing: it must equal the playing refresh verdict that
+        frame_refresh_ms already prescribes, or the dirty flag repaints
+        lazier than the policy says (a hard-coded 1000 ms collapsed
+        paint-while-playing to ~1 Hz and turned the bar's sub-second pixel
+        steps into visible jumps). Deriving it from REFRESH_PLAYING_MS
+        single-sources both so the key and the refresh policy can never
+        drift apart. 1000 ms matched only the m:ss text (second
+        resolution); the bar moves faster than a second, so second
+        granularity under-repainted. At 250 ms every bar-pixel change is
+        caught within one bucket while playing -- and a paused/static
+        scene still never repaints, because current_progress FROZES when
+        paused, the bucket stops ticking and the key stays clean (the
+        bucket rides the RENDERED value, not wall time: an epoch-aligned
+        bucket would misalign with a clock whose extrapolation starts at
+        measuredAt (+ offsetMs)).
     The scene is validated first (ProtocolError), same family as
     scene_digest: an invalid scene never compares "unchanged" against
     another invalid scene.
     """
     scene_part = NO_SCENE_DIGEST if scene is None else scene_digest(scene)
     state_part = display_state_digest(state, now_ms=now_ms)
-    bucket = int(current_progress(state, now_ms) // 1000)
+    bucket = int(current_progress(state, now_ms) // REFRESH_PLAYING_MS)
     return f"{scene_part}|{state_part}|{frame_index}|{bucket}"
 
 
@@ -2150,6 +2162,200 @@ def frame_refresh_ms(state, scene, *, media_root, now_ms=None, frame_index=0) ->
     if is_playing:
         wait = min(wait, REFRESH_PLAYING_MS)
     return int(wait)
+
+
+# ---------------------------------------------------------------------------
+# Loop pacing (S1-T7b): bounded wait + wake-on-state + dirty flag + ack
+# routing. main() needs a USB device, so every per-iteration DECISION lives
+# here as a pure unit; tests/test_render_pacer.py pins all of it
+# hardware-free. The loop itself only wires the results to render/emit.
+# ---------------------------------------------------------------------------
+
+
+def bounded_wait_seconds(fps, refresh_ms=None) -> float:
+    """Seconds the render loop may block before its next wake (S1-T7b).
+
+    Replaces the old fixed-rate 1/fps sleep. Two binding bounds, in both
+    directions:
+
+    * FLOOR ``1/fps`` -- lcdFps/DEFAULT_FPS stays the render-rate CEILING:
+      the refresh policy may make the cadence LAZIER than today, never
+      faster (video's 33 ms verdict at the default 10 fps still waits
+      100 ms). lcdFps must never be raised through the back door.
+    * CEILING ``STATUS_INTERVAL_S`` -- frame_refresh_ms reports up to the
+      1-hour static sentinel; blocking that long would cross the shell's
+      bridge watchdog (src/main.js + src/hardening.js: >5 s with NO status
+      AND NO ack restarts the sidecar -> frozen panel + restart storm).
+      Capping the wait keeps the ~1 Hz status heartbeat alive, so the
+      dirty flag may stop RENDERS but never HEARTBEATS.
+
+    ``refresh_ms=None`` (policy raised, or returned non-positive/NaN) falls
+    back to exactly today's blind cadence ``1/fps``: bounded, unsurprising,
+    alive. +inf is harmless: the ceiling wins through min().
+    """
+    try:
+        rate = 1.0 / int(fps)
+    except (TypeError, ValueError, ZeroDivisionError):
+        rate = 1.0 / DEFAULT_FPS
+    if not rate > 0:  # also rejects NaN defensively
+        rate = 1.0 / DEFAULT_FPS
+    if refresh_ms is None:
+        return rate
+    try:
+        refresh = float(refresh_ms)
+    except (TypeError, ValueError):
+        return rate
+    if math.isnan(refresh) or refresh <= 0:
+        return rate
+    return max(rate, min(refresh / 1000.0, STATUS_INTERVAL_S))
+
+
+def wait_for_state(pending, timeout_s):
+    """The loop's wake-up wait (S1-T7b): block at most ``timeout_s``, return
+    the envelope that ended the wait, or None on timeout.
+
+    This is the wake-on-state half: a FRESH ENVELOPE ends the wait
+    immediately instead of the old fixed-rate sleep running its full course
+    past a state push. The consumed envelope goes back to the CALLER, who
+    feeds it to :func:`drain_envelopes` as ``carried`` -- re-queueing it
+    with ``put()`` would order an OLDER seq BEHIND a newer one and break
+    drain-to-latest (scene retention's newest-wins rule depends on it).
+    """
+    try:
+        return pending.get(timeout=timeout_s)
+    except queue.Empty:
+        return None
+
+
+def drain_envelopes(pending, carried=None):
+    """Every envelope owed to this iteration, oldest first / newest last.
+
+    ``carried`` (the envelope :func:`wait_for_state` consumed) goes FIRST
+    and is never re-queued -- see wait_for_state for why. Ordering is
+    load-bearing: main() runs apply_scene_retention once per envelope in
+    this order and keeps the last state + seq (drain-to-latest, newest
+    wins).
+    """
+    items = []
+    if carried is not None:
+        items.append(carried)
+    while True:
+        try:
+            items.append(pending.get_nowait())
+        except queue.Empty:
+            return items
+
+
+class FramePlan:
+    """One render loop iteration's decisions (S1-T7b).
+
+    * ``wait_s`` -- how long the loop may block next (bounded both ways).
+    * ``render`` -- the DIRTY FLAG: False skips render/encode/send entirely
+      because the composed pixels would be byte-identical (that is where
+      the CPU/USB win lives).
+    * ``ack_seq`` -- seq to ack this iteration (None = emit no ack).
+    * ``frame_index`` -- the GIF selector value the key was computed with;
+      the loop passes it to render_portrait so key and pixels describe the
+      SAME frame at the SAME instant.
+    * ``key`` -- the composite frame key just computed (None on fail-safe).
+    """
+
+    __slots__ = ("wait_s", "render", "ack_seq", "frame_index", "key")
+
+    def __init__(self, wait_s, render, ack_seq, frame_index, key):
+        self.wait_s = wait_s
+        self.render = render
+        self.ack_seq = ack_seq
+        self.frame_index = frame_index
+        self.key = key
+
+
+class FramePacer:
+    """Pure decision core of the S1-T7b render loop: no I/O, no USB, no
+    clock reads of its own (now_ms is always passed in), so pytest covers
+    everything main() would otherwise decide behind a device.
+
+    Owns the cross-iteration state: the last painted key (dirty flag) and
+    the drained seq that still owes an ack. Single-threaded by
+    construction -- only main()'s loop thread touches it; the stdin reader
+    thread only enqueues.
+    """
+
+    def __init__(self, *, force=False):
+        # force = paint every iteration regardless of the dirty key.
+        # TEST-ONLY: `--once` is documented "tests only" in
+        # src/bridge-spawn.js:46 and tests/test_shell_spawn.js drives it
+        # with a demo state that is isPlaying:true but has NO measuredAt,
+        # so extrapolation is static and the composite key never changes --
+        # without force, frames would stall at 1 and `--once 3` would hang
+        # forever. Production (no --once) always gets the dirty flag.
+        self.force = force
+        self.last_key: Optional[str] = None
+        self._seq: Optional[int] = None
+        self._ack_owed = False
+
+    def note_drain(self, seq) -> None:
+        """Loop calls this once per DRAINED envelope: a drained seq must be
+        acked EVEN IF its frame is skipped as unchanged -- src/main.js's
+        pendingAcks entry never clears without its ack, so an unacked seq
+        would leak in the shell's map forever.
+        """
+        if seq is not None:
+            self._seq = seq
+            self._ack_owed = True
+
+    def plan(self, state, scene, *, now_ms, fps,
+             media_root=MEDIA_ROOT) -> FramePlan:
+        """Decide one iteration: wait, dirty flag, ack routing.
+
+        ACK CONTRACT (keeps tests/test_shell_spawn.js's exact-3-acks
+        baseline green): EVERY painted frame re-acks the current seq -- the
+        legacy behavior, one drained seq and three frames -> 6,6,6 -- PLUS
+        exactly one ack for a drained seq whose frame was skipped as
+        unchanged. plan() COMMITS the decision (clears the owed flag); the
+        loop always emits ``ack_seq`` immediately after plan() returns, so
+        clearing here is safe.
+        """
+        frame_index = 0
+        key = None
+        refresh_ms = None
+        try:
+            # frame_index must be the SAME selector render_portrait will use
+            # at the SAME now_ms: key and pixels must describe one frame.
+            frame_index = (
+                0 if scene is None
+                else gif_frame_index_at(scene, media_root, now_ms)
+            )
+            key = composite_frame_key(state, scene, now_ms=now_ms,
+                                      frame_index=frame_index)
+            refresh_ms = frame_refresh_ms(state, scene, media_root=media_root,
+                                          now_ms=now_ms,
+                                          frame_index=frame_index)
+        except Exception as exc:
+            # Fail-safe DIRECTION (documented decision): an invalid or
+            # unreadable scene must NEVER kill the loop. Paint
+            # unconditionally (render_portrait has its own try/except
+            # fallback to the legacy view), wait at today's 1/fps cadence,
+            # and INVALIDATE the cached key so the next healthy iteration
+            # repaints instead of leaving the fallback stuck on the panel.
+            # Never latches: the failure is re-evaluated from scratch on
+            # every iteration.
+            _warn_scene_fallback(exc)
+            self.last_key = None
+            return FramePlan(bounded_wait_seconds(fps, None), True,
+                             self._commit_ack(render=True), frame_index, None)
+        render = self.force or key != self.last_key  # first plan: paint
+        if render:
+            self.last_key = key
+        return FramePlan(bounded_wait_seconds(fps, refresh_ms), render,
+                         self._commit_ack(render=render), frame_index, key)
+
+    def _commit_ack(self, *, render):
+        ack = self._ack_owed or (render and self._seq is not None)
+        if not ack:
+            return None
+        self._ack_owed = False
+        return self._seq
 
 
 def portrait_to_buffer(portrait, rotation: str):
@@ -2581,41 +2787,80 @@ def main(argv=None) -> int:
     fps = DEFAULT_FPS
     frames = 0
     last_status = time.monotonic() - STATUS_INTERVAL_S  # emit immediately
+    # S1-T7b: wait / dirty-flag / ack decisions live in FramePacer (pure;
+    # pytest covers them without USB). force pins the `--once` smoke
+    # contract -- see FramePacer.__init__ for why tests-only mode paints
+    # every iteration even when the key says nothing changed.
+    pacer = FramePacer(force=args.once is not None)
+    # The envelope the wake-up wait consumed; carried into the next drain.
+    carried: Optional[Tuple[Optional[int], Dict[str, Any]]] = None
 
     try:
         while True:
             # Drain to the latest state; remember the newest seq for ACKs.
-            try:
-                while True:
-                    new_seq, new_state = pending.get_nowait()
-                    # `settings.scene` is the ONE retained field (see
-                    # apply_scene_retention): the shell omits the key while
-                    # its digest is unchanged, so replacing the state
-                    # wholesale here dropped the scene one push after every
-                    # edit. Every other field still comes from new_state.
-                    state, last_scene = apply_scene_retention(new_state, last_scene)
-                    if new_seq is not None:
-                        seq = new_seq
-                    fps = fps_from_state(state)
-            except queue.Empty:
-                pass
+            # `carried` (the envelope the wake-up wait consumed below) goes
+            # FIRST and is never re-queued: put() would order an older seq
+            # BEHIND a newer one and break drain-to-latest -- scene
+            # retention's newest-wins rule depends on that order.
+            envelopes = drain_envelopes(pending, carried)
+            carried = None
+            for new_seq, new_state in envelopes:
+                # `settings.scene` is the ONE retained field (see
+                # apply_scene_retention): the shell omits the key while
+                # its digest is unchanged, so replacing the state
+                # wholesale here dropped the scene one push after every
+                # edit. Every other field still comes from new_state.
+                state, last_scene = apply_scene_retention(new_state, last_scene)
+                if new_seq is not None:
+                    seq = new_seq
+                pacer.note_drain(new_seq)
+                fps = fps_from_state(state)
 
-            portrait = render_portrait(state, glass)
-            buffer_img = portrait_to_buffer(portrait, profile.rotation)
-            jpeg = encode_jpeg(buffer_img)
-            try:
-                send_frame(ep_out, profile, jpeg)
-            except Exception as exc:
-                emit({"type": "status", "status": "blocked", "panel": profile.name,
-                      "pm": pm, "sub": sub, "fps": fps, "queue": pending.qsize(),
-                      "frames": frames, "message": f"bulk write failed: {exc}"})
-                log(f"error: bulk write failed: {exc}")
-                close_device(dev)
-                return 3
-            frames += 1
+            # S1-T7b: ONE decision per iteration -- dirty key (skip
+            # render/encode/USB when the composed pixels would be
+            # byte-identical), refresh-bounded wait (always <=
+            # STATUS_INTERVAL_S, so the ~1 Hz heartbeat outlives a static
+            # scene), and ack routing (painted frame OR drained-but-
+            # unpainted seq).
+            scene = _scene_from_state(state)
+            now_ms = time.time() * 1000.0
+            plan = pacer.plan(state, scene, now_ms=now_ms, fps=fps)
 
-            if seq is not None:
-                emit({"type": "ack", "seq": seq})
+            # Heartbeat BEFORE the USB write, not only after it: the wait
+            # can now be a full STATUS_INTERVAL_S, so a slow-but-successful
+            # bulk write right after a full wait could otherwise push the
+            # next status/ack past the 5 s watchdog (the old 1/fps sleep
+            # was ~0.1 s and never stacked like that). Same guard as the
+            # post-render check below => still ~1 Hz cadence, no spam.
+            now = time.monotonic()
+            if now - last_status >= STATUS_INTERVAL_S:
+                emit({"type": "status", "panel": profile.name, "pm": pm, "sub": sub,
+                      "fps": fps, "queue": pending.qsize(), "frames": frames})
+                last_status = now
+
+            if plan.render:
+                portrait = render_portrait(state, glass, now_ms=now_ms,
+                                            frame_index=plan.frame_index)
+                buffer_img = portrait_to_buffer(portrait, profile.rotation)
+                jpeg = encode_jpeg(buffer_img)
+                try:
+                    send_frame(ep_out, profile, jpeg)
+                except Exception as exc:
+                    emit({"type": "status", "status": "blocked", "panel": profile.name,
+                          "pm": pm, "sub": sub, "fps": fps, "queue": pending.qsize(),
+                          "frames": frames, "message": f"bulk write failed: {exc}"})
+                    log(f"error: bulk write failed: {exc}")
+                    close_device(dev)
+                    return 3
+                frames += 1
+
+            # ACK contract (tests/test_shell_spawn.js asserts exactly 3 for
+            # --once 3, seqs 6,6,6): every painted frame re-acks the
+            # current seq, AND a drained seq whose frame was skipped as
+            # unchanged still gets its one ack -- src/main.js's pendingAcks
+            # never clears without it (an unacked seq is a leak).
+            if plan.ack_seq is not None:
+                emit({"type": "ack", "seq": plan.ack_seq})
 
             now = time.monotonic()
             if now - last_status >= STATUS_INTERVAL_S:
@@ -2625,7 +2870,13 @@ def main(argv=None) -> int:
 
             if args.once is not None and frames >= args.once:
                 break
-            time.sleep(1.0 / fps)
+
+            # Wake-up (S1-T7b): block at most plan.wait_s (heartbeat bound --
+            # the watchdog kills >5 s without status AND ack) and end EARLY
+            # on a fresh envelope (wake-on-state), never the old blind
+            # fixed-rate sleep. A consumed envelope is carried into the next
+            # drain above, never re-queued.
+            carried = wait_for_state(pending, plan.wait_s)
     except KeyboardInterrupt:
         log("interrupted")
     finally:

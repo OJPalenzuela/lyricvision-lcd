@@ -5,6 +5,7 @@ import { describe, expect, it, vi, type Mock } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
+import "./konvaJsdomShims";
 import App from "@/App";
 import SceneEditor from "@/components/SceneEditor";
 import type { LyricvisionBridge, StoredSettings } from "@/lib/bridge";
@@ -195,7 +196,7 @@ describe("persistent side rail (no button gate)", () => {
     // First section's controls are live without toggling anything, and
     // the live preview mounts with no gate click in between.
     expect(screen.getByRole("button", { name: "None" })).toBeInTheDocument();
-    await screen.findByAltText("Scene preview", {}, { timeout: 3000 });
+    await screen.findByRole("img", { name: "Scene preview" }, { timeout: 3000 });
   });
 
   it("switches panels on rail clicks: only the active section's controls mount", async () => {

@@ -4,6 +4,7 @@ import { describe, expect, it, vi, type Mock } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
+import "./konvaJsdomShims";
 import App from "@/App";
 import SceneEditor from "@/components/SceneEditor";
 import type { LyricvisionBridge, StoredSettings } from "@/lib/bridge";
@@ -180,8 +181,8 @@ function sceneWithMedia(
 describe('live preview states', () => {
   it('renders the preview <img> fed by the engine data URL', async () => {
     const { bridge } = setup();
-    const img = await screen.findByAltText("Scene preview", {}, { timeout: 3000 });
-    expect(img.getAttribute("src")).toMatch(/^data:image\/png;base64,/);
+    const img = await screen.findByRole("img", { name: "Scene preview" }, { timeout: 3000 });
+    expect(img.getAttribute("data-preview-src")).toMatch(/^data:image\/png;base64,/);
     expect(bridge.previewScene).toHaveBeenCalledWith(DEFAULT_SCENE);
   });
 
@@ -590,7 +591,7 @@ describe("persisting the scene", () => {
     expect(
       screen.queryByRole("button", { name: "Scene editor" })
     ).not.toBeInTheDocument();
-    const img = await screen.findByAltText("Scene preview", {}, { timeout: 3000 });
+    const img = await screen.findByRole("img", { name: "Scene preview" }, { timeout: 3000 });
     expect(img).toBeInTheDocument();
     expect(
       screen.getByRole("navigation", { name: "Scene sections" })

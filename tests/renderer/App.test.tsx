@@ -3,6 +3,7 @@ import { describe, expect, it, vi, type Mock } from 'vitest';
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 
+import './konvaJsdomShims';
 import App from '@/App';
 import type {
   LyricvisionBridge,

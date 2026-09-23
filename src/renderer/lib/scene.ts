@@ -106,6 +106,34 @@ export interface OverlayPlacement {
   color: string; // #rrggbb
 }
 
+/** Base widgets reuse the overlay center anchor and normalized size semantics. */
+export const BASE_WIDGET_KEYS = ['cover', 'title', 'artist', 'progress', 'lyrics'] as const;
+export type BaseWidget = (typeof BASE_WIDGET_KEYS)[number];
+
+/**
+ * Base-widget placement deliberately omits overlay rotation/color. Moving and
+ * resizing the live Spotify widgets is the minimum T24a contract; rotation
+ * would require a different per-widget rendering/layering contract.
+ *
+ * `x` and `y` are center-anchor fractions of portrait width and height. `size`
+ * is a fraction of portrait width for `cover` and `progress`, and of portrait
+ * height for `title`, `artist`, and `lyrics`.
+ */
+export type BasePlacement = Pick<OverlayPlacement, 'x' | 'y' | 'size'>;
+
+export type BasePlacements = {
+  /** `size` is a fraction of portrait width. */
+  cover?: BasePlacement;
+  /** `size` is a fraction of portrait height. */
+  title?: BasePlacement;
+  /** Owns the combined artist + album metadata block; size uses portrait height. */
+  artist?: BasePlacement;
+  /** `size` is a fraction of portrait width. */
+  progress?: BasePlacement;
+  /** `size` is a fraction of portrait height. */
+  lyrics?: BasePlacement;
+};
+
 export interface TextOverlay extends OverlayPlacement {
   kind: 'text';
   text: string;
@@ -121,6 +149,8 @@ export interface Scene {
   version: typeof SCENE_VERSION;
   background: Background;
   overlays: Overlay[];
+  /** Optional additive v1 field; old strict builds reject it as unknown. */
+  basePlacements?: BasePlacements;
 }
 
 /** Blank portrait scene. Treat as immutable — build new objects to edit. */
@@ -133,7 +163,8 @@ export const DEFAULT_SCENE: Scene = {
 type BackgroundKind = Background['kind'];
 type OverlayKind = Overlay['kind'];
 
-const SCENE_KEYS: readonly string[] = ['version', 'background', 'overlays'];
+const SCENE_KEYS: readonly string[] = ['version', 'background', 'overlays', 'basePlacements'];
+const BASE_PLACEMENT_KEYS: readonly string[] = ['x', 'y', 'size'];
 const NONE_BACKGROUND_KEYS: readonly string[] = ['kind'];
 const COLOR_BACKGROUND_KEYS: readonly string[] = ['kind', 'color'];
 const MEDIA_BACKGROUND_KEYS: readonly string[] = [
@@ -291,6 +322,32 @@ function isMediaFields(value: Record<string, unknown>): boolean {
   );
 }
 
+/** x/y/size-only placement field set for one base Spotify widget. */
+export function isBasePlacement(value: unknown): value is BasePlacement {
+  if (!isPlainObject(value)) return false;
+  if (firstUnknownKey(value, BASE_PLACEMENT_KEYS) !== null) return false;
+  return (
+    isUnitFraction(value['x']) &&
+    isUnitFraction(value['y']) &&
+    isUnitFraction(value['size'])
+  );
+}
+
+/** Optional keyed base-widget map; every present placement is complete. */
+export function isBasePlacements(value: unknown): value is BasePlacements {
+  if (!isPlainObject(value)) return false;
+  if (firstUnknownKey(value, BASE_WIDGET_KEYS) !== null) return false;
+  for (const widget of BASE_WIDGET_KEYS) {
+    if (
+      Object.prototype.hasOwnProperty.call(value, widget) &&
+      !isBasePlacement(value[widget])
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /** Placement field set shared by all overlays. */
 function isPlacementFields(value: Record<string, unknown>): boolean {
   return (
@@ -369,6 +426,12 @@ function isSceneShape(value: unknown): value is Scene {
   // same verdict as the gate, for every shape.
   for (let i = 0; i < overlays.length; i += 1) {
     if (!isOverlay(overlays[i])) return false;
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(value, 'basePlacements') &&
+    !isBasePlacements(value['basePlacements'])
+  ) {
+    return false;
   }
   return true;
 }

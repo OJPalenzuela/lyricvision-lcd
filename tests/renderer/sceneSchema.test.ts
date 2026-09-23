@@ -12,6 +12,7 @@ import {
   observeOverlays,
   sceneSchema,
   validateSceneForEditor,
+  validateSceneForModel,
 } from "@/lib/sceneSchema";
 
 const textOverlay = (text = "Hello"): Scene["overlays"][number] => ({
@@ -52,6 +53,47 @@ describe("scene Zod schema", () => {
     expect(
       sceneSchema.safeParse(sceneWithOverlay({ text: "a".repeat(4096) })).success
     ).toBe(true);
+  });
+
+  it("accepts the optional keyed base-placement map", () => {
+    const scene = {
+      ...DEFAULT_SCENE,
+      basePlacements: {
+        cover: { x: 0.2, y: 0.8, size: 0.2 },
+        title: { x: 0.8, y: 0.1, size: 0.05 },
+        artist: { x: 0.2, y: 0.9, size: 0.04 },
+        progress: { x: 0.2, y: 0.1, size: 0.3 },
+        lyrics: { x: 0.2, y: 0.9, size: 0.08 },
+      },
+    };
+    expect(sceneSchema.safeParse(scene).success).toBe(true);
+    expect(validateSceneForModel(scene).success).toBe(true);
+    expect(sceneSchema.safeParse({ ...DEFAULT_SCENE, basePlacements: {} }).success).toBe(
+      true
+    );
+  });
+
+  it.each([
+    ["non-object map", null, "basePlacements"],
+    ["array map", [], "basePlacements"],
+    ["unknown widget", { unknown: { x: 0.5, y: 0.5, size: 0.1 } }, "basePlacements"],
+    ["missing size", { cover: { x: 0.5, y: 0.5 } }, "basePlacements.cover.size"],
+    ["x above one", { cover: { x: 1.1, y: 0.5, size: 0.1 } }, "basePlacements.cover.x"],
+    ["y below zero", { cover: { x: 0.5, y: -0.1, size: 0.1 } }, "basePlacements.cover.y"],
+    ["NaN size", { cover: { x: 0.5, y: 0.5, size: Number.NaN } }, "basePlacements.cover.size"],
+    ["extra key", { cover: { x: 0.5, y: 0.5, size: 0.1, extra: true } }, "basePlacements.cover"],
+    ["rotation", { cover: { x: 0.5, y: 0.5, size: 0.1, rotation: 90 } }, "basePlacements.cover"],
+  ])("rejects malformed base placements: %s", (_name, basePlacements, path) => {
+    const scene = { ...DEFAULT_SCENE, basePlacements };
+    const result = sceneSchema.safeParse(scene);
+    expect(result.success).toBe(false);
+    expect(validateSceneForModel(scene).success).toBe(false);
+    expect(validateSceneForModel(scene)).toEqual({
+      success: false,
+      issues: expect.arrayContaining([
+        expect.objectContaining({ path }),
+      ]),
+    });
   });
 
   it.each([

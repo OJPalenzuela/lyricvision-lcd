@@ -197,7 +197,11 @@ const SCENE_OVERLAYS_CAP = 32;
 // lockstep-tested in tests/renderer/scene.test.ts.
 const DEFAULT_SCENE = { version: 1, background: { kind: 'none' }, overlays: [] };
 
-const SCENE_KEYS = ['version', 'background', 'overlays'];
+// S7-T24a adds an optional keyed field without changing scene version 1 or
+// wire v1. Known skew risk: an older build rejects this unknown scene key.
+const BASE_WIDGET_KEYS = ['cover', 'title', 'artist', 'progress', 'lyrics'];
+const BASE_PLACEMENT_KEYS = ['x', 'y', 'size'];
+const SCENE_KEYS = ['version', 'background', 'overlays', 'basePlacements'];
 const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
 
 // Mirror of SCENE_MAX_TEXT_CHARS in bridge/lcd_bridge.py (render cap) and
@@ -227,6 +231,13 @@ function sceneReject(field, error) {
 
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/** JSON.parse emits Object.prototype records; null is also a valid record prototype. */
+function isPlainRecord(value) {
+  if (!isPlainObject(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
 }
 
 /** First key of `value` outside `allowed` (null when the shape is clean). */
@@ -359,6 +370,48 @@ function validateSceneBackground(value) {
 }
 
 /** @returns {{ok:true, value:object}|{ok:false, field:string, error:string}} */
+function validateSceneBasePlacement(value, widget) {
+  const at = `basePlacements.${widget}`;
+  if (!isPlainObject(value)) return sceneReject(at, 'base placement must be an object');
+  const unknownKey = firstUnknownKey(value, BASE_PLACEMENT_KEYS);
+  if (unknownKey !== null) {
+    return sceneReject(`${at}.${unknownKey}`, `unknown base placement key: ${unknownKey}`);
+  }
+  for (const axis of BASE_PLACEMENT_KEYS) {
+    if (!isUnitFraction(value[axis])) {
+      return sceneReject(`${at}.${axis}`, `${axis} must be a fraction in [0,1]`);
+    }
+  }
+  return {
+    ok: true,
+    value: {
+      x: value.x,
+      y: value.y,
+      size: value.size,
+    },
+  };
+}
+
+/** @returns {{ok:true, value:object}|{ok:false, field:string, error:string}} */
+function validateSceneBasePlacements(value) {
+  if (!isPlainRecord(value)) {
+    return sceneReject('basePlacements', 'basePlacements must be a plain object');
+  }
+  const unknownKey = firstUnknownKey(value, BASE_WIDGET_KEYS);
+  if (unknownKey !== null) {
+    return sceneReject(`basePlacements.${unknownKey}`, `unknown base widget: ${unknownKey}`);
+  }
+  const placements = {};
+  for (const widget of BASE_WIDGET_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(value, widget)) continue;
+    const result = validateSceneBasePlacement(value[widget], widget);
+    if (!result.ok) return result;
+    placements[widget] = result.value;
+  }
+  return { ok: true, value: placements };
+}
+
+/** @returns {{ok:true, value:object}|{ok:false, field:string, error:string}} */
 function validateSceneOverlay(value, index) {
   const at = `overlays[${index}]`;
   if (!isPlainObject(value)) return sceneReject(at, 'overlay must be an object');
@@ -442,10 +495,13 @@ function validateSceneShape(input) {
     if (!result.ok) return result;
     overlays.push(result.value);
   }
-  return {
-    ok: true,
-    scene: { version: input.version, background: background.value, overlays },
-  };
+  const scene = { version: input.version, background: background.value, overlays };
+  if (Object.prototype.hasOwnProperty.call(input, 'basePlacements')) {
+    const basePlacements = validateSceneBasePlacements(input.basePlacements);
+    if (!basePlacements.ok) return basePlacements;
+    scene.basePlacements = basePlacements.value;
+  }
+  return { ok: true, scene };
 }
 
 module.exports = {

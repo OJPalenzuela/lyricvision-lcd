@@ -1,5 +1,5 @@
 {
-  "$comment": "Shared scene-shape corpus for S0-T1. Each entry pins BOTH implementations (src/renderer/lib/scene.ts isScene, src/hardening.js validateScene) to the same explicit verdict, so dual-copy drift fails at least one suite: tests/renderer/scene.test.ts and tests/unit/scene-validation.test.js both consume this file. JSON text cannot express NaN/Infinity or accessor properties, so numeric edge cases and the throwing-getter regression stay inline in the suites. 'materialize' declares the two shapes JSON cannot produce: array holes (deleteOverlays) and non-index own properties on the array (extraOverlayProps). 'field' is the path validateScene reports; only checked for invalid entries.",
+  "$comment": "Shared scene-shape corpus for S0-T1. Each entry pins BOTH implementations (src/renderer/lib/scene.ts isScene, src/hardening.js validateScene) to the same explicit verdict, so dual-copy drift fails at least one suite: tests/renderer/scene.test.ts and tests/unit/scene-validation.test.js both consume this file. JSON text cannot express NaN/Infinity or accessor properties, so numeric edge cases and the throwing-getter regression stay inline in the suites. 'materialize' declares the two shapes JSON cannot produce: array holes (deleteOverlays) and non-index own properties on the array (extraOverlayProps). 'field' is the path validateScene reports; only checked for invalid entries. The base-placement cases extend this same lockstep contract to the additive S7-T24a field.",
   "shapes": [
     {
       "name": "default-scene",
@@ -392,6 +392,83 @@
         "overlays": [
           { "kind": "gpu-temp", "x": 0.5, "y": 0.5, "size": 1.0000001, "rotation": 0, "color": "#ffffff" }
         ]
+      }
+    },
+    {
+      "name": "base-placements-valid",
+      "expect": "valid",
+      "shape": {
+        "version": 1,
+        "background": { "kind": "none" },
+        "overlays": [],
+        "basePlacements": {
+          "cover": { "x": 0.2, "y": 0.8, "size": 0.2 },
+          "title": { "x": 0.8, "y": 0.1, "size": 0.05 },
+          "artist": { "x": 0.2, "y": 0.9, "size": 0.04 },
+          "progress": { "x": 0.2, "y": 0.1, "size": 0.3 },
+          "lyrics": { "x": 0.2, "y": 0.9, "size": 0.08 }
+        }
+      }
+    },
+    {
+      "name": "base-placements-null",
+      "expect": "invalid",
+      "field": "basePlacements",
+      "shape": { "version": 1, "background": { "kind": "none" }, "overlays": [], "basePlacements": null }
+    },
+    {
+      "name": "base-placements-unknown-widget",
+      "expect": "invalid",
+      "field": "basePlacements.unknown",
+      "shape": {
+        "version": 1,
+        "background": { "kind": "none" },
+        "overlays": [],
+        "basePlacements": { "unknown": { "x": 0.5, "y": 0.5, "size": 0.1 } }
+      }
+    },
+    {
+      "name": "base-placement-missing-size",
+      "expect": "invalid",
+      "field": "basePlacements.cover.size",
+      "shape": {
+        "version": 1,
+        "background": { "kind": "none" },
+        "overlays": [],
+        "basePlacements": { "cover": { "x": 0.5, "y": 0.5 } }
+      }
+    },
+    {
+      "name": "base-placement-x-epsilon",
+      "expect": "invalid",
+      "field": "basePlacements.cover.x",
+      "shape": {
+        "version": 1,
+        "background": { "kind": "none" },
+        "overlays": [],
+        "basePlacements": { "cover": { "x": 1.0000001, "y": 0.5, "size": 0.1 } }
+      }
+    },
+    {
+      "name": "base-placement-rotation-rejected",
+      "expect": "invalid",
+      "field": "basePlacements.cover.rotation",
+      "shape": {
+        "version": 1,
+        "background": { "kind": "none" },
+        "overlays": [],
+        "basePlacements": { "cover": { "x": 0.5, "y": 0.5, "size": 0.1, "rotation": 90 } }
+      }
+    },
+    {
+      "name": "base-placement-extra-key",
+      "expect": "invalid",
+      "field": "basePlacements.cover.extra",
+      "shape": {
+        "version": 1,
+        "background": { "kind": "none" },
+        "overlays": [],
+        "basePlacements": { "cover": { "x": 0.5, "y": 0.5, "size": 0.1, "extra": true } }
       }
     },
     {

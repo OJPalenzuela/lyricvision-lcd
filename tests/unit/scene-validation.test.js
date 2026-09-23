@@ -76,8 +76,14 @@ function gpuTempOverlay(overrides = {}) {
   };
 }
 
-function sceneWith(background, overlays = []) {
-  return { version: 1, background, overlays };
+function sceneWith(background, overlays = [], basePlacements) {
+  const scene = { version: 1, background, overlays };
+  if (basePlacements !== undefined) scene.basePlacements = basePlacements;
+  return scene;
+}
+
+function basePlacement(overrides = {}) {
+  return { x: 0.5, y: 0.5, size: 0.1, ...overrides };
 }
 
 function manyOverlays(count) {
@@ -125,6 +131,71 @@ describe('validateScene (S0-T1 scene gate)', () => {
     const r = hardening.validateScene(hardening.DEFAULT_SCENE);
     expect(r.ok).toBe(true);
     expect(r.scene).toEqual({ version: 1, background: { kind: 'none' }, overlays: [] });
+  });
+
+  it('accepts an optional complete keyed base-placement map', () => {
+    const basePlacements = {
+      cover: basePlacement({ x: 0.2, y: 0.8, size: 0.2 }),
+      title: basePlacement({ x: 0.8, y: 0.1, size: 0.05 }),
+      artist: basePlacement({ x: 0.2, y: 0.9, size: 0.04 }),
+      progress: basePlacement({ x: 0.2, y: 0.1, size: 0.3 }),
+      lyrics: basePlacement({ x: 0.2, y: 0.9, size: 0.08 }),
+    };
+    const input = sceneWith({ kind: 'none' }, [], basePlacements);
+    const result = hardening.validateScene(input);
+    expect(result.ok).toBe(true);
+    expect(result.scene).toEqual(input);
+    expect(hardening.validateScene(sceneWith({ kind: 'none' }, [], {})).ok).toBe(true);
+  });
+
+  it.each([
+    ['non-object map', null, 'basePlacements'],
+    ['array map', [], 'basePlacements'],
+    ['unknown widget', { unknown: basePlacement() }, 'basePlacements.unknown'],
+    ['missing size', { cover: { x: 0.5, y: 0.5 } }, 'basePlacements.cover.size'],
+    ['x above one', { cover: basePlacement({ x: 1.1 }) }, 'basePlacements.cover.x'],
+    ['y below zero', { cover: basePlacement({ y: -0.1 }) }, 'basePlacements.cover.y'],
+    ['NaN size', { cover: basePlacement({ size: Number.NaN }) }, 'basePlacements.cover.size'],
+    ['extra key', { cover: { ...basePlacement(), extra: true } }, 'basePlacements.cover.extra'],
+    ['rotation', { cover: { ...basePlacement(), rotation: 90 } }, 'basePlacements.cover.rotation'],
+  ])('rejects malformed base placements: %s', (_name, basePlacements, field) => {
+    const result = hardening.validateScene(sceneWith({ kind: 'none' }, [], basePlacements));
+    expect(result.ok).toBe(false);
+    expect(result.field).toBe(field);
+  });
+
+  it('accepts JSON-parsed and null-prototype plain base-placement records', () => {
+    const jsonScene = JSON.parse(JSON.stringify(
+      sceneWith({ kind: 'none' }, [], { cover: basePlacement() })
+    ));
+    const validated = hardening.validateScene(jsonScene);
+    expect(validated.ok).toBe(true);
+    expect(validated.scene).toEqual(jsonScene);
+    expect(main.validateSettingsPatch({ scene: jsonScene }).accepted.scene).toEqual(jsonScene);
+
+    const nullPrototypePlacements = Object.assign(Object.create(null), {
+      cover: basePlacement(),
+    });
+    const nullPrototype = hardening.validateScene(
+      sceneWith({ kind: 'none' }, [], nullPrototypePlacements)
+    );
+    expect(nullPrototype.ok).toBe(true);
+    expect(nullPrototype.scene.basePlacements).toEqual({ cover: basePlacement() });
+  });
+
+  // The shared JSON corpus cannot express Date, Map, Set, or RegExp, so this
+  // security-boundary regression lives in the CommonJS validator suite.
+  it.each([
+    ['Date', () => new Date(0)],
+    ['Map', () => new Map()],
+    ['Set', () => new Set()],
+    ['RegExp', () => /x/],
+  ])('rejects a non-plain base-placement record: %s', (_name, makeValue) => {
+    const result = hardening.validateScene(
+      sceneWith({ kind: 'none' }, [], makeValue())
+    );
+    expect(result.ok).toBe(false);
+    expect(result.field).toBe('basePlacements');
   });
 
   it('accepts a full valid scene for each of the five background kinds', () => {
@@ -245,6 +316,20 @@ describe('settings: save accepts a validated scene (S0-T1)', () => {
     const r = main.validateSettingsPatch({ scene: valid });
     expect(r.rejected).toEqual([]);
     expect(r.accepted.scene).toEqual(valid);
+  });
+
+  it('carries valid base placements through settings: save and rejects malformed ones', () => {
+    const valid = sceneWith({ kind: 'none' }, [], {
+      cover: basePlacement({ x: 0.2, y: 0.8, size: 0.2 }),
+    });
+    expect(main.validateSettingsPatch({ scene: valid }).accepted.scene).toEqual(valid);
+
+    const invalid = sceneWith({ kind: 'none' }, [], {
+      cover: basePlacement({ size: 1.1 }),
+    });
+    const rejected = main.validateSettingsPatch({ scene: invalid });
+    expect(rejected.accepted).toEqual({});
+    expect(rejected.rejected).toContain('scene');
   });
 
   it('rejects an invalid scene as a whole key', () => {

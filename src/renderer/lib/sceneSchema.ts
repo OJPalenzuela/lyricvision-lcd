@@ -53,6 +53,29 @@ const placementFields = {
   color: hexColor,
 };
 
+/**
+ * Size is a fraction of portrait width for cover/progress and portrait height
+ * for title/artist/lyrics. The artist control owns the artist + album block.
+ */
+const basePlacementSchema = z.strictObject({
+  x: unitFraction,
+  y: unitFraction,
+  size: unitFraction,
+});
+
+const basePlacementsSchema = z.strictObject({
+  /** Size uses portrait width. */
+  cover: basePlacementSchema.optional(),
+  /** Size uses portrait height. */
+  title: basePlacementSchema.optional(),
+  /** Owns the combined artist + album metadata block; size uses portrait height. */
+  artist: basePlacementSchema.optional(),
+  /** Size uses portrait width. */
+  progress: basePlacementSchema.optional(),
+  /** Size uses portrait height. */
+  lyrics: basePlacementSchema.optional(),
+});
+
 const noneBackgroundSchema = z.strictObject({
   kind: z.literal("none"),
 });
@@ -153,6 +176,7 @@ export const sceneSchema = z.strictObject({
   version: z.literal(SCENE_VERSION),
   background: backgroundSchema,
   overlays: overlaysSchema,
+  basePlacements: basePlacementsSchema.optional(),
 });
 
 /**

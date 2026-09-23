@@ -28,7 +28,8 @@ import {
   type PlayerStatePush,
   type SpotifyState,
 } from "@/lib/bridge";
-import { DEFAULT_SCENE, type Scene } from "@/lib/scene";
+import { DEFAULT_SCENE } from "@/lib/scene";
+import { useSceneStore } from "@/lib/sceneStore";
 
 function statusBadgeVariant(status: string | undefined) {
   switch (status) {
@@ -54,10 +55,16 @@ export default function App() {
   const [serial, setSerial] = useState("");
   const [runAtStartup, setRunAtStartup] = useState(false);
 
-  // Scene editor (S2-T8): the scene is APP-level state — it survives the
-  // editor closing and feeds Save/Reset; editor-only UI state stays local.
-  const [scene, setScene] = useState<Scene>(DEFAULT_SCENE);
-  const [savedScene, setSavedScene] = useState<Scene>(DEFAULT_SCENE);
+  // Scene editor (S2-T8): the scene is APP-level in lifetime (it survives
+  // the editor closing and feeds Save/Reset) but its single source of
+  // truth is the Zustand scene store (S7-T20) — App is a thin shell that
+  // only wires store state/actions into SceneEditor's props contract.
+  // Editor-only UI state (selection, section, drafts) stays in SceneEditor.
+  const scene = useSceneStore((s) => s.scene);
+  const setScene = useSceneStore((s) => s.setScene);
+  const hydrateScene = useSceneStore((s) => s.hydrate);
+  const markSceneSaved = useSceneStore((s) => s.markSaved);
+  const resetScene = useSceneStore((s) => s.resetToSaved);
 
   // Live snapshots pushed by the main process.
   const [player, setPlayer] = useState<PlayerSnapshot | null>(null);
@@ -114,10 +121,6 @@ export default function App() {
     setExclusivityText(exclusivityTextOf(exclusivityWarn));
   }, []);
 
-  // Reset reverts to the last PERSISTED scene (boot load or a successful save).
-  const restoreScene = useCallback(() => setScene(savedScene), [savedScene]);
-  const handleSceneSaved = useCallback((next: Scene) => setSavedScene(next), []);
-
   useEffect(() => {
     const api = window.lyricvision;
     if (!api) {
@@ -142,9 +145,10 @@ export default function App() {
         setSyncOffsetSec(offsetMs / 1000);
         setSerial(settings.serial || "");
         setRunAtStartup(settings.runAtStartup === true);
-        const bootScene = settings.scene ?? DEFAULT_SCENE;
-        setScene(bootScene);
-        setSavedScene(bootScene);
+        // why: ONE hydrate installs the scene, the Reset baseline, and a
+        // cleared history — the boot scene is the root of undo, not an
+        // undoable edit (see sceneStore.hydrate).
+        hydrateScene(settings.scene ?? DEFAULT_SCENE);
         applySnapshot({
           player: null,
           spotify: initialSpotify,
@@ -476,8 +480,8 @@ export default function App() {
             <SceneEditor
               scene={scene}
               onSceneChange={setScene}
-              onReset={restoreScene}
-              onSaved={handleSceneSaved}
+              onReset={resetScene}
+              onSaved={markSceneSaved}
             />
           </CardContent>
         </Card>

@@ -3,9 +3,11 @@ import {
   useRef,
   useState,
   useCallback,
+  type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
 
+import { Redo2, Undo2 } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
 
 import { Button } from "@/components/ui/button";
@@ -20,17 +22,22 @@ import {
   type MediaBackgroundKind,
   type Scene,
 } from "@/lib/scene";
+import { useCanRedo, useCanUndo, useSceneStore } from "@/lib/sceneStore";
 
 /**
  * Scene editor (S2-T8): WYSIWYG surface whose every committed value is
  * previewed live on the connected panel (scene:preview IPC over the live
  * sidecar pipe) and persisted through saveSettings({scene}).
  *
- * STATE SPLIT (why): the scene lives in App state — it must survive this
- * component unmounting and feeds Save/Reset. Everything else is ephemeral
+ * STATE SPLIT (why): the scene lives in the Zustand scene store
+ * (S7-T20, src/renderer/lib/sceneStore.ts) — it must survive this
+ * component unmounting and feeds Save/Reset plus undo/redo; App wires the
+ * store into the props below, so this component stays props-driven (the
+ * direct-to-store canvas rewrite is S7-T21). Everything else is ephemeral
  * editor UI state kept local on purpose: numeric drafts (typing must not be
- * interrupted by round-trips), overlay selection, preview bytes, and status
- * messages never leak into settings.
+ * interrupted by round-trips), overlay selection, the active rail section,
+ * preview bytes, and status messages never leak into settings — and never
+ * into undo history either, which records scene mutations only.
  *
  * MEDIA IMPORT (S2-T8b): Image/GIF buttons ask MAIN to open the file dialog
  * and embed the picked file as a data: URL — the renderer never sees a file
@@ -418,6 +425,22 @@ async function sceneRejectionDetail(
 }
 
 /**
+ * Elements that own the browser's native text undo/redo (typing surfaces).
+ * WHY: the editor-scoped Ctrl+Z must never steal history from a text
+ * field — editing text and editing the scene are different histories, and
+ * native undo is what users expect while a field has focus.
+ */
+function isEditableTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  return (
+    target.tagName === "INPUT" ||
+    target.tagName === "TEXTAREA" ||
+    target.tagName === "SELECT" ||
+    target.isContentEditable
+  );
+}
+
+/**
  * Rail sections (S7-T19): TRCC-style persistent navigation — pick a
  * section and edit immediately, no enter/exit edit mode. The labels are
  * the owner-specified section names; every other copy in this file stays
@@ -480,6 +503,11 @@ export default function SceneEditor({
   const [saveError, setSaveError] = useState<string | null>(null);
   const [savedNote, setSavedNote] = useState<string | null>(null);
   const [importError, setImportError] = useState<string | null>(null);
+
+  // S7-T20 history controls: reactive against zundo's temporal store, so
+  // the buttons disable live at both ends of history (empty at boot root).
+  const canUndo = useCanUndo();
+  const canRedo = useCanRedo();
 
   // Refs, not state: debounce timers and stale-reply guards must not trigger
   // re-renders or capture stale closures.
@@ -889,6 +917,24 @@ export default function SceneEditor({
     setSaveError(null);
     setSavedNote(null);
     setImportError(null);
+  };
+
+  /**
+   * Editor-scoped history shortcuts (S7-T20). WHY each check, in order:
+   * - the handler sits on the editor ROOT, so it fires only for events
+   *   originating inside the editor (scope: it cannot hijack the rest of
+   *   the window);
+   * - editable targets are skipped BEFORE anything else: native text undo
+   *   wins in inputs, so Ctrl+Z mid-typing never moves the scene;
+   * - preventDefault only when WE handle it, so the skipped native path is
+   *   never suppressed. Ctrl+Shift+Z redos. Windows-only app → Ctrl key.
+   */
+  const handleEditorKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (!event.ctrlKey || (event.key !== "z" && event.key !== "Z")) return;
+    if (isEditableTarget(event.target)) return;
+    event.preventDefault();
+    if (event.shiftKey) useSceneStore.getState().redo();
+    else useSceneStore.getState().undo();
   };
 
   // Panels are hoisted into variables so the rail can swap them while
@@ -1336,28 +1382,60 @@ export default function SceneEditor({
     SCENE_SECTIONS[0].label;
 
   return (
-    <div className="flex items-start gap-4">
+    <div className="flex items-start gap-4" onKeyDown={handleEditorKeyDown}>
       {/* S7-T19 persistent rail: pick a section and edit immediately —
           there is no enter/exit edit mode anymore. aria-pressed mirrors
-          the switch, the same pattern the background kind pills use. */}
-      <nav
-        aria-label="Scene sections"
-        className="flex w-32 shrink-0 flex-col gap-1"
-      >
-        {SCENE_SECTIONS.map((item) => (
+          the switch, the same pattern the background kind pills use. The
+          history row (S7-T20) shares this always-visible column: same
+          width, no layout redesign — and it sits OUTSIDE <nav> because
+          undo/redo are actions, not navigation landmarks. */}
+      <div className="flex w-32 shrink-0 flex-col">
+        <nav aria-label="Scene sections" className="flex flex-col gap-1">
+          {SCENE_SECTIONS.map((item) => (
+            <Button
+              key={item.id}
+              type="button"
+              size="sm"
+              variant={section === item.id ? "default" : "ghost"}
+              aria-pressed={section === item.id}
+              onClick={() => setSection(item.id)}
+              className="justify-start"
+            >
+              {item.label}
+            </Button>
+          ))}
+        </nav>
+        <div
+          className="mt-2 flex gap-1"
+          role="group"
+          aria-label="Scene history"
+        >
           <Button
-            key={item.id}
             type="button"
             size="sm"
-            variant={section === item.id ? "default" : "ghost"}
-            aria-pressed={section === item.id}
-            onClick={() => setSection(item.id)}
-            className="justify-start"
+            variant="outline"
+            className="flex-1"
+            aria-label="Undo"
+            title="Undo (Ctrl+Z)"
+            disabled={!canUndo}
+            onClick={() => useSceneStore.getState().undo()}
           >
-            {item.label}
+            <Undo2 className="h-4 w-4" aria-hidden="true" />
           </Button>
-        ))}
-      </nav>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="flex-1"
+            aria-label="Redo"
+            title="Redo (Ctrl+Shift+Z)"
+            disabled={!canRedo}
+            onClick={() => useSceneStore.getState().redo()}
+          >
+            <Redo2 className="h-4 w-4" aria-hidden="true" />
+          </Button>
+        </div>
+      </div>
 
       {/* Panel column: exactly ONE panel is mounted at a time; motion
           gives the swap a snappy 150 ms slide/fade (first user-visible

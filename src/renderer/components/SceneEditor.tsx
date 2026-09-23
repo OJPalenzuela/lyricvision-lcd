@@ -6,6 +6,8 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from "react";
 
+import { AnimatePresence, motion } from "motion/react";
+
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
@@ -415,6 +417,22 @@ async function sceneRejectionDetail(
   return "Scene value not allowed. Fix it and try again.";
 }
 
+/**
+ * Rail sections (S7-T19): TRCC-style persistent navigation — pick a
+ * section and edit immediately, no enter/exit edit mode. The labels are
+ * the owner-specified section names; every other copy in this file stays
+ * English. `fondo` owns the background KIND together with its transform
+ * because the validator binds transform keys to image/gif backgrounds
+ * only: splitting them would split one editing concern across sections.
+ */
+const SCENE_SECTIONS = [
+  { id: "fondo", label: "Fondo" },
+  { id: "capas", label: "Capas" },
+  { id: "propiedades", label: "Propiedades" },
+] as const;
+
+type SceneSectionId = (typeof SCENE_SECTIONS)[number]["id"];
+
 interface SceneEditorProps {
   scene: Scene;
   onSceneChange: (scene: Scene) => void;
@@ -431,6 +449,8 @@ export default function SceneEditor({
 }: SceneEditorProps) {
   // Ephemeral editor-local state (see file header).
   const [selected, setSelected] = useState<number | null>(0);
+  // Active rail section (S7-T19): persistent nav, no edit-mode toggle.
+  const [section, setSection] = useState<SceneSectionId>("fondo");
   // Gesture bookkeeping: the ref is the source of truth for the window
   // listeners (no stale closures); state only drives the ghost re-render.
   const [gesture, setGestureState] = useState<GestureState | null>(null);
@@ -871,8 +891,10 @@ export default function SceneEditor({
     setImportError(null);
   };
 
-  return (
-    <div className="space-y-4">
+  // Panels are hoisted into variables so the rail can swap them while
+  // each block keeps its original shape (S7-T19 restructure).
+  const fondoPanel = (
+    <>
       {/* Background: none/color + media import (S2-T8b). Video (S3) and
           gpu-temp (S4) stay out until their own tasks. */}
       <div className="space-y-2">
@@ -1033,8 +1055,15 @@ export default function SceneEditor({
           </p>
         )}
       </div>
+    </>
+  );
 
-      {/* Text overlays: rows select, one inspector edits the selection. */}
+  // Capas: the overlay list — select/add/remove (reorder via dnd-kit is
+  // S7-T22). The numeric inspector moved to the Propiedades section.
+  const capasPanel = (
+    <>
+      {/* Text overlays: rows select; the selected one is edited in the
+          Propiedades section. */}
       <div className="space-y-2">
         <p className="text-sm font-medium">Text overlays</p>
         <div className="flex flex-wrap gap-2">
@@ -1068,6 +1097,23 @@ export default function SceneEditor({
         {atCap && (
           <p className="text-xs text-muted-foreground">
             Limit reached: remove an overlay before adding another.
+          </p>
+        )}
+      </div>
+    </>
+  );
+
+  // Propiedades: the selected overlay's inspector (position/size/rotation/
+  // color). With no selection the panel shows guidance instead of dead
+  // controls (the preview's empty-space click deselects).
+  const inspectorPanel = (
+    <>
+      <div className="space-y-2">
+        <p className="text-sm font-medium">Propiedades</p>
+        {!selectedOverlay && (
+          <p className="text-xs text-muted-foreground">
+            Select an overlay on the preview or in Capas to edit its
+            properties.
           </p>
         )}
 
@@ -1134,7 +1180,14 @@ export default function SceneEditor({
           </div>
         )}
       </div>
+    </>
+  );
 
+  // Main area (S7-T19): the live engine preview plus the persistence
+  // actions — both stay visible from EVERY rail section, so no control
+  // ever hides behind a tab.
+  const previewBlock = (
+    <>
       {/* Live preview: bytes rendered by the sidecar's engine on the panel.
           The overlay layer on top is GUIDANCE only — it composes no pixels;
           the PNG below it stays the single source of truth. The stage fixes
@@ -1254,7 +1307,11 @@ export default function SceneEditor({
           LyricVision holds the display.
         </p>
       </div>
+    </>
+  );
 
+  const saveBlock = (
+    <>
       <div className="flex flex-wrap items-center gap-2">
         <Button type="button" onClick={() => void handleSave()}>
           Save scene
@@ -1271,6 +1328,62 @@ export default function SceneEditor({
           {saveError}
         </p>
       )}
+    </>
+  );
+
+  const activeLabel =
+    SCENE_SECTIONS.find((item) => item.id === section)?.label ??
+    SCENE_SECTIONS[0].label;
+
+  return (
+    <div className="flex items-start gap-4">
+      {/* S7-T19 persistent rail: pick a section and edit immediately —
+          there is no enter/exit edit mode anymore. aria-pressed mirrors
+          the switch, the same pattern the background kind pills use. */}
+      <nav
+        aria-label="Scene sections"
+        className="flex w-32 shrink-0 flex-col gap-1"
+      >
+        {SCENE_SECTIONS.map((item) => (
+          <Button
+            key={item.id}
+            type="button"
+            size="sm"
+            variant={section === item.id ? "default" : "ghost"}
+            aria-pressed={section === item.id}
+            onClick={() => setSection(item.id)}
+            className="justify-start"
+          >
+            {item.label}
+          </Button>
+        ))}
+      </nav>
+
+      {/* Panel column: exactly ONE panel is mounted at a time; motion
+          gives the swap a snappy 150 ms slide/fade (first user-visible
+          win of the motion migration). The region label tracks state. */}
+      <AnimatePresence mode="wait" initial={false}>
+        <motion.div
+          key={section}
+          role="region"
+          aria-label={activeLabel}
+          initial={{ opacity: 0, x: 8 }}
+          animate={{ opacity: 1, x: 0 }}
+          exit={{ opacity: 0, x: -8 }}
+          transition={{ duration: 0.15 }}
+          className="min-w-0 flex-1 space-y-4"
+        >
+          {section === "fondo" && fondoPanel}
+          {section === "capas" && capasPanel}
+          {section === "propiedades" && inspectorPanel}
+        </motion.div>
+      </AnimatePresence>
+
+      {/* Main area: live preview + Save/Reset, always visible. */}
+      <div className="flex min-w-0 flex-1 flex-col gap-4">
+        {previewBlock}
+        {saveBlock}
+      </div>
     </div>
   );
 }

@@ -8,6 +8,44 @@ import App from "@/App";
 import SceneEditor from "@/components/SceneEditor";
 import type { LyricvisionBridge, StoredSettings } from "@/lib/bridge";
 import { DEFAULT_SCENE, SCENE_OVERLAYS_CAP, type MediaBackgroundKind, type Scene } from "@/lib/scene";
+import type { ReactNode } from "react";
+
+// motion/react (S7-T19 panel-swap animation) mocked to a passthrough so
+// jsdom needs no Web Animations API: children render into a plain <div>.
+// Honest coverage, not a bypass — every query below reads the REAL
+// controls through this wrapper; if it swallowed content, they'd fail.
+vi.mock("motion/react", () => {
+  type PanelProps = {
+    children?: ReactNode;
+    className?: string;
+    role?: string;
+    "aria-label"?: string;
+    initial?: unknown;
+    animate?: unknown;
+    exit?: unknown;
+    transition?: unknown;
+  };
+  return {
+    AnimatePresence: ({ children }: { children?: ReactNode }) => <>{children}</>,
+    motion: {
+      div: ({
+        children,
+        className,
+        role,
+        "aria-label": ariaLabel,
+      }: PanelProps) => (
+        <div className={className} role={role} aria-label={ariaLabel}>
+          {children}
+        </div>
+      ),
+    },
+  };
+});
+
+/** S7-T19 rail navigation: jump to a scene section by its rail label. */
+const goSection = (name: "Fondo" | "Capas" | "Propiedades"): void => {
+  fireEvent.click(screen.getByRole("button", { name }));
+};
 
 const requireNative = createRequire(import.meta.url);
 interface HardeningGate {
@@ -430,13 +468,18 @@ describe("background: media import (S2-T8b)", () => {
 });
 
 describe("text overlays", () => {
+  // S7-T19: the list lives in the Capas rail section and the inspector in
+  // Propiedades — the flow now navigates the rail between steps. Every
+  // assertion below is unchanged: relocation must not weaken coverage.
   it("adds, selects, edits and removes text overlays", async () => {
     const { onChange, user } = setup();
 
+    goSection("Capas");
     await user.click(screen.getByRole("button", { name: "Add text overlay" }));
     const row = screen.getByRole("button", { name: "Overlay 1" });
     expect(row).toHaveAttribute("aria-pressed", "true"); // new overlay auto-selects
 
+    goSection("Propiedades");
     await user.clear(screen.getByLabelText("Overlay text"));
     await user.type(screen.getByLabelText("Overlay text"), "Hello");
     const first = lastScene(onChange);
@@ -444,15 +487,20 @@ describe("text overlays", () => {
     expect(first.overlays[0]).toMatchObject({ kind: "text", text: "Hello" });
     expect(hardening.validateScene(first).ok).toBe(true);
 
+    goSection("Capas");
     await user.click(screen.getByRole("button", { name: "Add text overlay" }));
+    goSection("Propiedades");
     await user.clear(screen.getByLabelText("Overlay text"));
     await user.type(screen.getByLabelText("Overlay text"), "Second");
     expect(screen.getByLabelText("Overlay text")).toHaveValue("Second");
 
     // Select the first row again: the inspector must show ITS values.
+    goSection("Capas");
     await user.click(screen.getByRole("button", { name: "Overlay 1" }));
+    goSection("Propiedades");
     expect(screen.getByLabelText("Overlay text")).toHaveValue("Hello");
 
+    goSection("Capas");
     await user.click(screen.getByRole("button", { name: "Remove overlay" }));
     const after = lastScene(onChange);
     expect(after.overlays).toHaveLength(1);
@@ -468,6 +516,7 @@ describe("text overlays", () => {
       ),
     };
     setup(full);
+    goSection("Capas"); // the cap copy lives with the list it gates
     expect(screen.getByRole("button", { name: "Add text overlay" })).toBeDisabled();
     expect(
       screen.getByText(/Limit reached: remove an overlay before adding another\./)
@@ -478,7 +527,9 @@ describe("text overlays", () => {
 describe("numeric inspector clamping", () => {
   it("clamps an overlay unit field into [0,1] before it reaches scene state", async () => {
     const { onChange, user } = setup();
+    goSection("Capas");
     await user.click(screen.getByRole("button", { name: "Add text overlay" }));
+    goSection("Propiedades");
     const x = screen.getByLabelText("Overlay X (0-1)") as HTMLInputElement;
 
     fireEvent.change(x, { target: { value: "5" } });
@@ -529,15 +580,21 @@ describe("persisting the scene", () => {
     expect(hardening.validateScene(patch.scene).ok).toBe(true);
   });
 
-  it("is reachable from the app surface", async () => {
+  it("is reachable from the app surface without a gate", async () => {
     const bridge = makeBridge();
     window.lyricvision = bridge;
-    const user = userEvent.setup();
     render(<App />);
     await waitFor(() => expect(bridge.getSettings).toHaveBeenCalled());
-    await user.click(screen.getByRole("button", { name: "Scene editor" }));
+    // S7-T19: the old "Scene editor" toggle is gone for good — the rail
+    // is persistent, so the preview must mount with zero clicks.
+    expect(
+      screen.queryByRole("button", { name: "Scene editor" })
+    ).not.toBeInTheDocument();
     const img = await screen.findByAltText("Scene preview", {}, { timeout: 3000 });
     expect(img).toBeInTheDocument();
+    expect(
+      screen.getByRole("navigation", { name: "Scene sections" })
+    ).toBeInTheDocument();
   });
 
   it("saves a media scene with the embedded source intact", async () => {
@@ -577,7 +634,9 @@ describe("persisting the scene", () => {
 describe("overlay text length gate", () => {
   it("caps the input at 4096 and clamps an over-long paste out of scene state", async () => {
     const { onChange, user } = setup();
+    goSection("Capas"); // list first (S7-T19 rail), then the inspector
     await user.click(screen.getByRole("button", { name: "Add text overlay" }));
+    goSection("Propiedades");
     const input = screen.getByLabelText("Overlay text") as HTMLInputElement;
     expect(input).toHaveAttribute("maxLength", "4096");
 
@@ -595,7 +654,9 @@ describe("overlay text length gate", () => {
   // that would snap the controlled input back to the previous text.
   it("commits an empty overlay text that still passes both gates", async () => {
     const { onChange, user } = setup();
+    goSection("Capas");
     await user.click(screen.getByRole("button", { name: "Add text overlay" }));
+    goSection("Propiedades");
     await user.clear(screen.getByLabelText("Overlay text"));
     expect(lastScene(onChange).overlays[0]).toMatchObject({ text: "" });
     expect(hardening.validateScene(lastScene(onChange)).ok).toBe(true);
@@ -712,7 +773,9 @@ describe("scene round trip through App (S2-T10)", () => {
     render(<App />);
     await waitFor(() => expect(bridge.getSettings).toHaveBeenCalled());
 
-    await user.click(screen.getByRole("button", { name: "Scene editor" }));
+    // S7-T19: the editor is persistent; reach the overlay inspector through
+    // the rail (the old "Scene editor" toggle no longer exists).
+    await user.click(screen.getByRole("button", { name: "Propiedades" }));
     const sceneSection = screen.getByRole("region", { name: "Scene" });
     const input = within(sceneSection).getByLabelText(
       "Overlay text"

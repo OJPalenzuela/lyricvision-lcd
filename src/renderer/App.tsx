@@ -58,7 +58,6 @@ export default function App() {
   // editor closing and feeds Save/Reset; editor-only UI state stays local.
   const [scene, setScene] = useState<Scene>(DEFAULT_SCENE);
   const [savedScene, setSavedScene] = useState<Scene>(DEFAULT_SCENE);
-  const [sceneOpen, setSceneOpen] = useState(false);
 
   // Live snapshots pushed by the main process.
   const [player, setPlayer] = useState<PlayerSnapshot | null>(null);
@@ -461,7 +460,9 @@ export default function App() {
         </Card>
       </section>
 
-      {/* Scene editor (S2-T8): live WYSIWYG preview over the sidecar pipe. */}
+      {/* Scene editor (S2-T8, reworked S7-T19): a TRCC-style persistent
+          side rail — every section is always editable, no enter/exit
+          toggle; the live preview stays in the main area. */}
       <section aria-label="Scene" className="mt-4">
         <Card>
           <CardHeader>
@@ -472,21 +473,12 @@ export default function App() {
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-3">
-            <Button
-              type="button"
-              aria-expanded={sceneOpen}
-              onClick={() => setSceneOpen((open) => !open)}
-            >
-              Scene editor
-            </Button>
-            {sceneOpen && (
-              <SceneEditor
-                scene={scene}
-                onSceneChange={setScene}
-                onReset={restoreScene}
-                onSaved={handleSceneSaved}
-              />
-            )}
+            <SceneEditor
+              scene={scene}
+              onSceneChange={setScene}
+              onReset={restoreScene}
+              onSaved={handleSceneSaved}
+            />
           </CardContent>
         </Card>
       </section>

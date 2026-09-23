@@ -13,6 +13,44 @@ import {
   type Scene,
   type TextOverlay,
 } from "@/lib/scene";
+import type { ReactNode } from "react";
+
+// motion/react (S7-T19 panel-swap animation) mocked to a passthrough so
+// jsdom needs no Web Animations API: children render into a plain <div>.
+// Honest coverage, not a bypass — every query below reads the REAL
+// controls through this wrapper; if it swallowed content, they'd fail.
+vi.mock("motion/react", () => {
+  type PanelProps = {
+    children?: ReactNode;
+    className?: string;
+    role?: string;
+    "aria-label"?: string;
+    initial?: unknown;
+    animate?: unknown;
+    exit?: unknown;
+    transition?: unknown;
+  };
+  return {
+    AnimatePresence: ({ children }: { children?: ReactNode }) => <>{children}</>,
+    motion: {
+      div: ({
+        children,
+        className,
+        role,
+        "aria-label": ariaLabel,
+      }: PanelProps) => (
+        <div className={className} role={role} aria-label={ariaLabel}>
+          {children}
+        </div>
+      ),
+    },
+  };
+});
+
+/** S7-T19 rail navigation: jump to a scene section by its rail label. */
+const goSection = (name: "Fondo" | "Capas" | "Propiedades"): void => {
+  fireEvent.click(screen.getByRole("button", { name }));
+};
 
 const requireNative = createRequire(import.meta.url);
 interface HardeningGate {
@@ -193,6 +231,9 @@ describe("S2-T9 drag to move", () => {
     expect(scene.overlays[0].y).toBe(0.5);
     expect(hardening.validateScene(scene).ok).toBe(true);
 
+    // Inspector lives in the Propiedades rail section (S7-T19): switch to
+    // it before reading the drag back out.
+    goSection("Propiedades");
     // Numeric inspector reads back exactly what the drag committed.
     const x = screen.getByLabelText("Overlay X (0-1)") as HTMLInputElement;
     const y = screen.getByLabelText("Overlay Y (0-1)") as HTMLInputElement;
@@ -235,6 +276,7 @@ describe("S2-T9 resize handle", () => {
     const { onChange } = setup(sceneWithOverlays([textOverlay("Hi")]));
     await previewReady();
     stubStageRect();
+    goSection("Propiedades"); // inspector lives behind the rail (S7-T19)
     const handle = screen.getByRole("button", { name: "Resize overlay 1" });
 
     // +24 px x and +42.7 px y on 240x427 = +0.1 and +0.1 -> size 0.1+0.1 = 0.2.
@@ -272,6 +314,7 @@ describe("S2-T9 rotation handle", () => {
     const { onChange } = setup(sceneWithOverlays([textOverlay("Hi")]));
     await previewReady();
     stubStageRect();
+    goSection("Propiedades"); // inspector lives behind the rail (S7-T19)
     const handle = screen.getByRole("button", { name: "Rotate overlay 1" });
     const rotation = screen.getByLabelText(
       "Overlay rotation (degrees)"
@@ -386,7 +429,11 @@ describe("S2-T9 selection", () => {
     await previewReady();
     stubStageRect();
 
-    // List -> preview.
+    // List -> preview. The rail mounts one section at a time (TRCC-style), so
+    // each assertion switches to the section that owns the control: rows live
+    // in Capas, the inspector in Propiedades. The preview stage itself is
+    // always mounted in the main column.
+    goSection("Capas");
     await user.click(screen.getByRole("button", { name: "Overlay 2" }));
     expect(screen.getByRole("button", { name: "Select overlay 2" })).toHaveAttribute(
       "aria-pressed",
@@ -396,24 +443,29 @@ describe("S2-T9 selection", () => {
       "aria-pressed",
       "false"
     );
+    goSection("Propiedades");
     expect(screen.getByLabelText("Overlay X (0-1)")).toHaveValue("0.25");
 
     // Preview -> list (pointer).
     await user.click(screen.getByRole("button", { name: "Select overlay 1" }));
+    goSection("Capas");
     expect(screen.getByRole("button", { name: "Overlay 1" })).toHaveAttribute(
       "aria-pressed",
       "true"
     );
+    goSection("Propiedades");
     expect(screen.getByLabelText("Overlay X (0-1)")).toHaveValue("0.5");
 
     // Keyboard-only selection: focus + Enter, no pointer involved.
     const box2 = screen.getByRole("button", { name: "Select overlay 2" });
     box2.focus();
     await user.keyboard("{Enter}");
+    goSection("Capas");
     expect(screen.getByRole("button", { name: "Overlay 2" })).toHaveAttribute(
       "aria-pressed",
       "true"
     );
+    goSection("Propiedades");
     expect(screen.getByLabelText("Overlay X (0-1)")).toHaveValue("0.25");
 
     // Empty-space click deselects: inspector goes away, no row stays pressed.
@@ -425,6 +477,7 @@ describe("S2-T9 selection", () => {
     expect(
       screen.queryByLabelText("Overlay rotation (degrees)")
     ).not.toBeInTheDocument();
+    goSection("Capas");
     expect(screen.getByRole("button", { name: "Overlay 1" })).toHaveAttribute(
       "aria-pressed",
       "false"
@@ -448,6 +501,7 @@ describe("S2-T9 overlay cap under drag", () => {
     const { onChange } = setup(full);
     await previewReady();
     stubStageRect();
+    goSection("Capas");
     expect(screen.getByRole("button", { name: "Add text overlay" })).toBeDisabled();
 
     const box = screen.getByRole("button", { name: "Select overlay 1" });
@@ -470,6 +524,7 @@ describe("S2-T9 inspector edit then drag", () => {
 
     // Commit a new x through the inspector first: the gesture must read its
     // origin from THIS scene, not from the mount-time value (0.5).
+    goSection("Propiedades");
     const x = screen.getByLabelText("Overlay X (0-1)") as HTMLInputElement;
     fireEvent.change(x, { target: { value: "0.25" } });
     expect(lastScene(onChange).overlays[0].x).toBe(0.25);

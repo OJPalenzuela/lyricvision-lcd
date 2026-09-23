@@ -200,6 +200,27 @@ const DEFAULT_SCENE = { version: 1, background: { kind: 'none' }, overlays: [] }
 const SCENE_KEYS = ['version', 'background', 'overlays'];
 const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
 
+// Mirror of SCENE_MAX_TEXT_CHARS in bridge/lcd_bridge.py (render cap) and
+// bridge/protocol.py (validation cap). The literal necessarily repeats here
+// (this CommonJS gate cannot import a TS module); the duplication is pinned
+// equal by tests/renderer/text-length-gate.test.ts, which reads the constant
+// straight out of lcd_bridge.py.
+const SCENE_MAX_TEXT_CHARS = 4096;
+
+// S2-T8d: settings:save -> validateScene is the ONLY path by which a scene
+// reaches disk, so the 16 MB media budget must hold HERE too — as a character
+// ceiling on background.source, not only on the media:import read.
+// Arithmetic from the sidecar cap SCENE_MAX_GIF_BYTES = 16 * 1024 * 1024 raw
+// bytes (bridge/lcd_bridge.py): base64 is 4 * ceil(raw / 3) chars
+// (4 * ceil(16777216 / 3) = 22369624) plus the longest accepted prefix
+// "data:image/jpeg;base64," (23 chars) = 22369647.
+// NEVER lower: a legitimately-at-cap import encodes to exactly this many
+// chars and must still save; anything longer encodes more than 16 MB of raw
+// media, which no import path can produce. Pinned to the Python constant by
+// tests/unit/media-import.test.js; both JS copies pinned by
+// tests/renderer/media-source-gate.test.ts.
+const SCENE_MEDIA_SOURCE_MAX_CHARS = 22369647;
+
 function sceneReject(field, error) {
   return { ok: false, field, error };
 }
@@ -303,6 +324,12 @@ function validateSceneBackground(value) {
       if (!isSource(value.source)) {
         return sceneReject('background.source', 'source must be a non-empty string without NUL or ".." segments');
       }
+      if (value.source.length > SCENE_MEDIA_SOURCE_MAX_CHARS) {
+        return sceneReject(
+          'background.source',
+          `source exceeds the ${SCENE_MEDIA_SOURCE_MAX_CHARS} character limit`
+        );
+      }
       if (!isFiniteNumber(value.rotation)) return sceneReject('background.rotation', 'rotation must be a finite number');
       if (typeof value.flipH !== 'boolean') return sceneReject('background.flipH', 'flipH must be a boolean');
       if (typeof value.scale !== 'number' || !Number.isFinite(value.scale) || value.scale <= 0) {
@@ -343,6 +370,9 @@ function validateSceneOverlay(value, index) {
   }
   if (value.kind === 'text' && typeof value.text !== 'string') {
     return sceneReject(`${at}.text`, 'text must be a string');
+  }
+  if (value.kind === 'text' && value.text.length > SCENE_MAX_TEXT_CHARS) {
+    return sceneReject(`${at}.text`, `text exceeds ${SCENE_MAX_TEXT_CHARS} characters`);
   }
   if (!isUnitFraction(value.x)) return sceneReject(`${at}.x`, 'x must be a fraction in [0,1]');
   if (!isUnitFraction(value.y)) return sceneReject(`${at}.y`, 'y must be a fraction in [0,1]');
@@ -431,6 +461,8 @@ module.exports = {
   // Scene gate (S0-T1): validator + shared constants for the settings `scene`
   // key. DEFAULT_SCENE/SCENE_OVERLAYS_CAP mirror src/renderer/lib/scene.ts.
   validateScene,
+  SCENE_MAX_TEXT_CHARS,
+  SCENE_MEDIA_SOURCE_MAX_CHARS,
   DEFAULT_SCENE,
   SCENE_OVERLAYS_CAP,
 };

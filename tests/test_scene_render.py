@@ -460,3 +460,31 @@ def test_shared_corpus_invalid_shapes_fail_validation(tmp_path):
             render(shape["shape"], tmp_path)
         assert exc.value.field == shape["field"], shape["name"]
         assert not isinstance(exc.value, lcd_bridge.SceneRenderError)
+
+
+# --------------------------------------------------------------------------
+# Text-length defence in depth (S2-T8c)
+# --------------------------------------------------------------------------
+
+def test_render_refuses_overlong_text_before_drawing(tmp_path):
+    """render_scene validates FIRST (lcd_bridge.render_scene -> validate_scene),
+    so the typed validation reason wins at the public entry point once S2-T8c
+    moves the length gate into validate_scene."""
+    over = "a" * (lcd_bridge.SCENE_MAX_TEXT_CHARS + 1)
+    scene = scene_of({"kind": "none"}, [text_overlay(text=over)])
+    with pytest.raises(ProtocolError) as caught:
+        render(scene, tmp_path)
+    assert caught.value.reason == "text_too_long", caught.value.reason
+    assert caught.value.field == "overlays[0].text", caught.value.field
+
+
+def test_draw_layer_keeps_its_own_text_cap():
+    """Defence in depth unchanged: a caller that SKIPS validation still hits
+    the render-side raise in _draw_text_overlay (same typed reason, same cap
+    constant)."""
+    canvas = Image.new("RGBA", (480, 854), (0, 0, 0, 0))
+    over = "a" * (lcd_bridge.SCENE_MAX_TEXT_CHARS + 1)
+    with pytest.raises(lcd_bridge.SceneRenderError) as caught:
+        lcd_bridge._draw_text_overlay(canvas, text_overlay(text=over), 0)
+    assert caught.value.reason == "text_too_long", caught.value.reason
+    assert caught.value.field == "overlays[0].text", caught.value.field

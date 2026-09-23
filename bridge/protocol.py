@@ -166,6 +166,12 @@ PREVIEW_UNAVAILABLE_MESSAGE = (
 # SCENE_OVERLAYS_CAP). See validate_scene for the lockstep contract.
 SCENE_VERSION = 1
 SCENE_OVERLAYS_CAP = 32
+# Overlay text cap, mirrored from lcd_bridge.SCENE_MAX_TEXT_CHARS (the
+# import direction lcd_bridge -> protocol forbids importing it back).
+# Enforced at VALIDATION time with the SAME typed reason the renderer raises;
+# pinned equal to the render cap by tests (test_protocol_text_cap_equals_
+# the_render_cap and tests/renderer/text-length-gate.test.ts).
+SCENE_MAX_TEXT_CHARS = 4096
 SCENE_KEYS = ("version", "background", "overlays")
 PREVIEW_REQUEST_KEYS = ("v", "cmd", "reqId", "maxWidth", "maxHeight", "scene")
 
@@ -337,6 +343,17 @@ def _validate_overlay(value: Any, index: int) -> Dict[str, Any]:
         _reject(f"{at}.{unknown}", f"unknown overlay key: {unknown}")
     if value.get("kind") == "text" and not isinstance(value.get("text"), str):
         _reject(f"{at}.text", "text must be a string")
+    text = value.get("text")
+    if isinstance(text, str) and len(text) > SCENE_MAX_TEXT_CHARS:
+        # Typed reason, NOT invalid_request: this is the same discriminator
+        # the renderer raises, so the refusal reads identically at every
+        # layer. lcd_bridge._draw_text_overlay keeps its own raise as
+        # defence in depth for callers that skip validation.
+        raise ProtocolError(
+            "text_too_long",
+            f"{at}.text: text exceeds {SCENE_MAX_TEXT_CHARS} characters",
+            field=f"{at}.text",
+        )
     for axis in ("x", "y", "size"):
         if not _is_unit_fraction(value.get(axis)):
             _reject(f"{at}.{axis}", f"{axis} must be a fraction in [0,1]")

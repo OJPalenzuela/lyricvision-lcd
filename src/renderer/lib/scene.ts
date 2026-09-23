@@ -30,7 +30,31 @@ export const SCENE_VERSION = 1;
  */
 export const SCENE_OVERLAYS_CAP = 32;
 
+/**
+ * Cap on one text overlay's `text`, in characters. Mirrors
+ * SCENE_MAX_TEXT_CHARS in bridge/lcd_bridge.py and bridge/protocol.py; the
+ * cross-language pin in tests/renderer/text-length-gate.test.ts fails if any
+ * of the copies drifts apart.
+ */
+export const SCENE_MAX_TEXT_CHARS = 4096;
+
+/**
+ * Cap on a media background's `source`, in characters (S2-T8d). Mirrors
+ * SCENE_MEDIA_SOURCE_MAX_CHARS in src/hardening.js — both JS gates must
+ * agree on one number, derived from SCENE_MAX_GIF_BYTES in
+ * bridge/lcd_bridge.py as 4 * ceil(raw / 3) base64 chars + 23 (the longest
+ * accepted `data:` prefix); tests/renderer/media-source-gate.test.ts pins
+ * every copy so none can drift alone.
+ */
+export const SCENE_MEDIA_SOURCE_MAX_CHARS = 22369647;
+
 export type BackgroundFit = 'fit' | 'fill';
+
+/**
+ * Media background kinds the editor can IMPORT (S2-T8b). `video` exists in
+ * the schema but has no import path yet, so it stays out of this union.
+ */
+export type MediaBackgroundKind = 'image' | 'gif';
 
 /** Render transform for media backgrounds, applied in glass space. */
 export interface Transform {
@@ -206,6 +230,7 @@ function isHexColor(value: unknown): value is string {
 function isSource(value: unknown): value is string {
   if (typeof value !== 'string' || value.length === 0) return false;
   if (value.includes('\u0000')) return false;
+  if (value.length > SCENE_MEDIA_SOURCE_MAX_CHARS) return false;
   return !value.split(/[/\\]/).includes('..');
 }
 
@@ -302,8 +327,14 @@ export function isOverlay(value: unknown): value is Overlay {
   if (!isOverlayKind(kind)) return false;
   if (firstUnknownKey(value, overlayKeys(kind)) !== null) return false;
   switch (kind) {
-    case 'text':
-      return typeof value['text'] === 'string' && isPlacementFields(value);
+    case 'text': {
+      const text = value['text'];
+      return (
+        typeof text === 'string' &&
+        text.length <= SCENE_MAX_TEXT_CHARS &&
+        isPlacementFields(value)
+      );
+    }
     case 'gpu-temp':
       return isPlacementFields(value);
     default:

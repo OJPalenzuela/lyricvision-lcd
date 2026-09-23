@@ -12,6 +12,8 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('lyricvision', {
   getSettings: () => ipcRenderer.invoke('settings:get'),
   saveSettings: (patch) => ipcRenderer.invoke('settings:save', patch),
+  previewScene: (scene) => ipcRenderer.invoke('scene:preview', scene),
+  importMedia: (kind) => ipcRenderer.invoke('media:import', kind),
   connectSpotify: (clientId) => ipcRenderer.invoke('spotify:connect', { clientId }),
   listDisplays: () => ipcRenderer.invoke('display:list'),
   minimize: () => ipcRenderer.invoke('window:minimize'),

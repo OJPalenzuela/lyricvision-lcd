@@ -3,6 +3,8 @@
  * The IPC surface and settings keys are fixed — this file only types them.
  */
 
+import type { MediaBackgroundKind, Scene } from "./scene";
+
 /** Whitelisted settings keys the renderer may send (never `layout`, never tokens). */
 export interface SettingsPatch {
   spotifyClientId: string;
@@ -11,6 +13,8 @@ export interface SettingsPatch {
   syncOffsetMs: number;
   serial: string;
   runAtStartup: boolean;
+  /** Scene layout (S2-T8): re-validated by hardening.validateScene in settings:save. */
+  scene: Scene;
 }
 
 export interface StoredSettings {
@@ -20,6 +24,7 @@ export interface StoredSettings {
   layout: string;
   serial: string;
   runAtStartup: boolean;
+  scene: Scene;
 }
 
 export interface SpotifyState {
@@ -92,6 +97,14 @@ export interface LyricvisionBridge {
     startupSupported: boolean;
   }>;
   saveSettings(patch: Partial<SettingsPatch>): Promise<{ rejected: string[] }>;
+  previewScene(scene: Scene): Promise<string>;
+  /**
+   * Open the main-process file dialog and embed the picked PNG/JPEG/GIF as
+   * a data: URL (S2-T8b). Resolves null when the dialog is cancelled —
+   * callers must treat null as a no-op. Rejections carry `token: detail`
+   * (never a path); map them in the editor, not here.
+   */
+  importMedia(kind: MediaBackgroundKind): Promise<string | null>;
   connectSpotify(clientId: string): Promise<unknown>;
   listDisplays(): Promise<unknown>;
   minimize(): void;
